@@ -174,9 +174,11 @@ class MIoTCameraInstance:
         video_qualities: List
         if isinstance(qualities, MIoTCameraVideoQuality):
             # channel count > 1, use default quality foreach channel
-            video_qualities = [self.camera_info.video_quality for _ in range(channel_count)]
+            _LOGGER.info("外部传入的视频质量, %d", self.camera_info.video_quality)
+            video_qualities = [2 for _ in range(channel_count)]
         elif isinstance(qualities, List):
-            video_qualities = [self.camera_info.video_quality for _ in qualities]
+            _LOGGER.info("外部传入的视频质量, %d", self.camera_info.video_quality)
+            video_qualities = [2 for _ in qualities]
         else:
             _LOGGER.error("invalid camera video qualities, %s", qualities)
             raise MIoTCameraError(f"invalid camera video qualities, {qualities}")
@@ -391,7 +393,7 @@ class MIoTCameraInstance:
                 await self.__unregister_raw_data_async(channel)
 
     async def __try_start_async(self) -> None:
-        _LOGGER.info("try start camera, %s", self._did)
+        _LOGGER.info("已经__try_start_async try start camera, %s %s", self._did, self._video_qualities)
         # Cancel reconnect task if exists.
         if self._reconnect_timer:
             self._reconnect_timer.cancel()
