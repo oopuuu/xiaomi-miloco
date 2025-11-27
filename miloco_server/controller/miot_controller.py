@@ -337,7 +337,7 @@ async def video_stream_websocket(
     current_user: str = Depends(verify_websocket_token)
 ):
     """Video stream WebSocket."""
-    logger.info(
+    logger.warning(
         "WebSocket connection request, %s, %s.%d %d", current_user, camera_id, channel, video_quality)
     start_time: datetime = datetime.now()
     token_hash: str = str(hash(websocket.cookies.get("access_token")))
