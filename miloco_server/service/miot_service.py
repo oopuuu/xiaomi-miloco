@@ -292,7 +292,7 @@ class MiotService:
             logger.error("Failed to send notification: %s", str(e))
             raise BusinessException(f"Failed to send notification: {str(e)}") from e
 
-    async def start_video_stream(self, camera_id: str, channel: int, callback):
+    async def start_video_stream(self, camera_id: str, channel: int, callback , video_quality: int):
         """
         Start video stream (business layer method)
 
@@ -308,7 +308,7 @@ class MiotService:
             logger.info("Starting video stream: camera_id=%s, channel=%s", camera_id, channel)
             if callback:
                 await self._miot_proxy.start_camera_raw_stream(
-                    camera_id, channel, callback)
+                    camera_id, channel, callback, video_quality)
             else:
                 logger.info("No callback function, only recording startup request: camera_id=%s", camera_id)
         except Exception as e:

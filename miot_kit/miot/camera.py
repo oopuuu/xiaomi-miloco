@@ -165,7 +165,7 @@ class MIoTCameraInstance:
         self,
         qualities: MIoTCameraVideoQuality | List[MIoTCameraVideoQuality] = MIoTCameraVideoQuality.LOW,
         pin_code: Optional[str] = None,
-        enable_audio: bool = False,
+        enable_audio: bool = True,
         enable_reconnect: bool = False,
         enable_record: bool = False,
     ) -> None:
@@ -174,9 +174,9 @@ class MIoTCameraInstance:
         video_qualities: List
         if isinstance(qualities, MIoTCameraVideoQuality):
             # channel count > 1, use default quality foreach channel
-            video_qualities = [qualities.value for _ in range(channel_count)]
+            video_qualities = [self.camera_info.video_quality for _ in range(channel_count)]
         elif isinstance(qualities, List):
-            video_qualities = [quality.value for quality in qualities]
+            video_qualities = [self.camera_info.video_quality for _ in qualities]
         else:
             _LOGGER.error("invalid camera video qualities, %s", qualities)
             raise MIoTCameraError(f"invalid camera video qualities, {qualities}")

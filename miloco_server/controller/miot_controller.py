@@ -21,6 +21,7 @@ from miloco_server.middleware import (
 from miloco_server.middleware import MiotServiceException, ResourceNotFoundException
 from miloco_server.schema.common_schema import NormalResponse
 from miloco_server.service.manager import get_manager
+from miot_kit.miot.types import MIoTCameraVideoQuality
 
 logger = logging.getLogger(name=__name__)
 
@@ -252,14 +253,14 @@ class MIoTVideoStreamManager:
         logger.info("Init MIoT Video WS Manager")
 
     async def new_connection(
-        self, websocket: WebSocket, user_name: str, token_hash: str,  camera_id: str, channel: int
+        self, websocket: WebSocket, user_name: str, token_hash: str,  camera_id: str, channel: int, video_quality: int
     ) -> str:
         """New video stream connection."""
         camera_tag = f"{camera_id}.{channel}"
         if camera_tag not in self._camera_connect_map or not self._camera_connect_map[camera_tag]:
             self._camera_connect_map[camera_tag] = {}
             await manager.miot_service.start_video_stream(
-                camera_id=camera_id, channel=channel, callback=self.__video_stream_callback)
+                camera_id=camera_id, channel=channel, callback=self.__video_stream_callback, video_quality=video_quality)
             logger.info("Start video stream, %s.%d", camera_id, channel)
         user_tag = f"{user_name}.{token_hash}"
         self._camera_connect_map[camera_tag].setdefault(user_tag, OrderedDict())
@@ -332,11 +333,12 @@ async def video_stream_websocket(
     websocket: WebSocket,
     camera_id: str,
     channel: int,
+    video_quality: int = MIoTCameraVideoQuality.HIGH.value,
     current_user: str = Depends(verify_websocket_token)
 ):
     """Video stream WebSocket."""
     logger.info(
-        "WebSocket connection request, %s, %s.%d", current_user, camera_id, channel)
+        "WebSocket connection request, %s, %s.%d %d", current_user, camera_id, channel, video_quality)
     start_time: datetime = datetime.now()
     token_hash: str = str(hash(websocket.cookies.get("access_token")))
     cid: Optional[str] = None
@@ -347,7 +349,8 @@ async def video_stream_websocket(
             user_name=current_user,
             token_hash=token_hash,
             camera_id=camera_id,
-            channel=channel)
+            channel=channel,
+            video_quality=video_quality,)
         while True:
             try:
                 message = await websocket.receive_text()

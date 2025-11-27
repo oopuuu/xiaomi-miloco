@@ -142,13 +142,14 @@ class MiotProxy:
 
 
     async def start_camera_raw_stream(self, camera_id: str, channel: int,
-                                    callback: Callable[[str, bytes, int, int, int], Coroutine]):
+                                    callback: Callable[[str, bytes, int, int, int], Coroutine], video_quality: int):
         if camera_id not in self._camera_img_managers:
             logger.warning("Camera %s not found in managers", camera_id)
             return
         instance = self._camera_img_managers[camera_id]
+        instance.camera_info.video_quality = video_quality
         await instance.register_raw_stream(callback, channel)
-        logger.info("Successfully started camera raw stream, camera_id: %s, channel: %s", camera_id, channel)
+        logger.info("Successfully started camera raw stream, camera_id: %s, channel: %s, quality: %d", camera_id, channel, video_quality)
 
 
     async def stop_camera_raw_stream(self, camera_id: str, channel: int):

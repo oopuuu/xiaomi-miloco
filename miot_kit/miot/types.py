@@ -129,6 +129,7 @@ class MIoTCameraInfo(MIoTDeviceInfo):
     """MIoT Camera Info, inherited from MIoTDeviceInfo."""
     channel_count: int = Field(description="Camera channel count")
     camera_status: MIoTCameraStatus = Field(description="Camera status")
+    video_quality: int = Field(description="Video stream quality")
 
 
 class MIoTLanDeviceInfo(BaseModel):
