@@ -10,7 +10,8 @@ import os
 from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Optional
-from fastapi import APIRouter, Depends, WebSocket
+from functools import partial
+from fastapi import APIRouter, Depends, WebSocket, Query
 from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect, WebSocketState
 
@@ -36,7 +37,6 @@ async def xiaomi_home_callback(code: str, state: str):
     logger.info(
         "Xiaomi Home authorization callback: code=%s, state=%s", code, state)
 
-    # Read HTML template file
     template_path = os.path.join(os.path.dirname(
         __file__), "..", "templates", "miot_login_callback.html")
     try:
@@ -48,36 +48,26 @@ async def xiaomi_home_callback(code: str, state: str):
 
     try:
         await manager.miot_service.process_xiaomi_home_callback(code, state)
-
         logger.info("Xiaomi Home authorization callback processed successfully")
-
-        # Authorization successful
         title = "Authorization Successful"
         content = "Xiaomi Home authorization successful, you can close this page"
         button = "Close"
         success = True
-
     except MiotServiceException as e:
         logger.error(
             "Xiaomi Home authorization callback processing failed - MiOT service error: %s", e.message)
-
-        # Authorization failed
         title = "Authorization Failed"
         content = f"Xiaomi Home authorization failed: {e.message}"
         button = "Close"
         success = False
-
-    except Exception as e:  # pylint: disable=broad-exception-caught
+    except Exception as e:
         logger.error(
             "Unknown error occurred during Xiaomi Home authorization callback processing: %s", str(e))
-
-        # Unknown error
         title = "Authorization Failed"
         content = f"Unknown error occurred during Xiaomi Home authorization: {str(e)}"
         button = "Close"
         success = False
 
-    # Fill HTML template
     web_page = template_content.replace("TITLE_PLACEHOLDER", title)
     web_page = web_page.replace("CONTENT_PLACEHOLDER", content)
     web_page = web_page.replace("BUTTON_PLACEHOLDER", button)
@@ -91,9 +81,7 @@ async def xiaomi_home_callback(code: str, state: str):
 async def get_miot_login_status(current_user: str = Depends(verify_token)):
     """Check MiOT login status"""
     logger.info("MiOT login status API called, user: %s", current_user)
-
     result = await manager.miot_service.get_miot_login_status()
-
     logger.info("MiOT login status: Login successful")
     return NormalResponse(
         code=0,
@@ -106,9 +94,7 @@ async def get_miot_login_status(current_user: str = Depends(verify_token)):
 async def get_miot_user_info(current_user: str = Depends(verify_token)):
     """Get MiOT user information"""
     logger.info("Get MiOT user info API called, user: %s", current_user)
-
     user_info = await manager.miot_service.get_miot_user_info()
-
     logger.info("Successfully retrieved Xiaomi Home user information")
     return NormalResponse(
         code=0,
@@ -121,9 +107,7 @@ async def get_miot_user_info(current_user: str = Depends(verify_token)):
 async def get_miot_camera_list(current_user: str = Depends(verify_token)):
     """Get MiOT camera list"""
     logger.info("Get MiOT camera list API called, user: %s", current_user)
-
     camera_list = await manager.miot_service.get_miot_camera_list()
-
     logger.info(
         "Successfully retrieved Xiaomi Home camera list - Count: %s", len(camera_list))
     return NormalResponse(
@@ -131,6 +115,7 @@ async def get_miot_camera_list(current_user: str = Depends(verify_token)):
         message="MiOT camera list retrieved successfully",
         data=camera_list
     )
+
 
 @router.get(path="/device_list", summary="Get MiOT device list", response_model=NormalResponse)
 async def get_miot_device_list(current_user: str = Depends(verify_token)):
@@ -143,6 +128,7 @@ async def get_miot_device_list(current_user: str = Depends(verify_token)):
         message="MiOT device list retrieved successfully",
         data=device_list
     )
+
 
 @router.get(path="/refresh_miot_all_info", summary="Refresh MiOT all information", response_model=NormalResponse)
 async def refresh_miot_all_info(current_user: str = Depends(verify_token)):
@@ -161,9 +147,7 @@ async def refresh_miot_all_info(current_user: str = Depends(verify_token)):
 async def refresh_miot_cameras(current_user: str = Depends(verify_token)):
     """Refresh MiOT camera information"""
     logger.info("Refresh MiOT cameras API called, user: %s", current_user)
-
     result = await manager.miot_service.refresh_miot_cameras()
-
     logger.info("Successfully refreshed Xiaomi Home camera information")
     return NormalResponse(
         code=0,
@@ -176,9 +160,7 @@ async def refresh_miot_cameras(current_user: str = Depends(verify_token)):
 async def refresh_miot_scenes(current_user: str = Depends(verify_token)):
     """Refresh MiOT scene information"""
     logger.info("Refresh MiOT scenes API called, user: %s", current_user)
-
     result = await manager.miot_service.refresh_miot_scenes()
-
     logger.info("Successfully refreshed Xiaomi Home scene information")
     return NormalResponse(
         code=0,
@@ -191,9 +173,7 @@ async def refresh_miot_scenes(current_user: str = Depends(verify_token)):
 async def refresh_miot_user_info(current_user: str = Depends(verify_token)):
     """Refresh MiOT user information"""
     logger.info("Refresh MiOT user info API called, user: %s", current_user)
-
     result = await manager.miot_service.refresh_miot_user_info()
-
     logger.info("Successfully refreshed Xiaomi Home user information")
     return NormalResponse(
         code=0,
@@ -206,9 +186,7 @@ async def refresh_miot_user_info(current_user: str = Depends(verify_token)):
 async def refresh_miot_devices(current_user: str = Depends(verify_token)):
     """Refresh MiOT device information"""
     logger.info("Refresh MiOT devices API called, user: %s", current_user)
-
     result = await manager.miot_service.refresh_miot_devices()
-
     logger.info("Successfully refreshed Xiaomi Home device information")
     return NormalResponse(
         code=0,
@@ -228,6 +206,7 @@ async def get_miot_scene_actions(current_user: str = Depends(verify_token)):
         data=actions
     )
 
+
 @router.get(path="/send_notify", summary="Send notification", response_model=NormalResponse)
 async def send_notify(notify: str, current_user: str = Depends(verify_token)):
     """Send notification"""
@@ -243,7 +222,8 @@ async def send_notify(notify: str, current_user: str = Depends(verify_token)):
 class MIoTVideoStreamManager:
     """MIoT Video WS Manager."""
     _CAMERA_CONNECT_COUNT_MAX: int = 4
-    # key=camera_id.channel, value={user_name: {user_tag: Dict[id, websocket]}}
+
+    # Key: "camera_id.channel.video_quality"
     _camera_connect_map: Dict[str, Dict[str, OrderedDict[str, WebSocket]]]
     _camera_connect_id: int
 
@@ -253,75 +233,98 @@ class MIoTVideoStreamManager:
         logger.info("Init MIoT Video WS Manager")
 
     async def new_connection(
-        self, websocket: WebSocket, user_name: str, token_hash: str,  camera_id: str, channel: int, video_quality: int
+            self, websocket: WebSocket, user_name: str, token_hash: str, camera_id: str, channel: int,
+            video_quality: int
     ) -> str:
         """New video stream connection."""
-        camera_tag = f"{camera_id}.{channel}"
+
+        camera_tag = f"{camera_id}.{channel}.{video_quality}"
+
         if camera_tag not in self._camera_connect_map or not self._camera_connect_map[camera_tag]:
             self._camera_connect_map[camera_tag] = {}
+
+            callback_func = partial(self.__video_stream_callback, video_quality=video_quality)
+
+            logger.info("Requesting stream start: %s", camera_tag)
             await manager.miot_service.start_video_stream(
-                camera_id=camera_id, channel=channel, callback=self.__video_stream_callback, video_quality=video_quality)
-            logger.info("Start video stream, %s.%d", camera_id, channel)
+                camera_id=camera_id,
+                channel=channel,
+                callback=callback_func,
+                video_quality=video_quality
+            )
+
         user_tag = f"{user_name}.{token_hash}"
         self._camera_connect_map[camera_tag].setdefault(user_tag, OrderedDict())
         connection_id = str(self._camera_connect_id)
         self._camera_connect_id += 1
         self._camera_connect_map[camera_tag][user_tag][connection_id] = websocket
-        logger.info("New video stream connection, %s, %s, %s", camera_tag, user_tag, connection_id)
+        logger.info("New WS client joined group: %s (ID: %s)", camera_tag, connection_id)
+
         if len(self._camera_connect_map[camera_tag][user_tag]) > self._CAMERA_CONNECT_COUNT_MAX:
-            # pylint: disable=unused-variable
-            logger.warning("Too many connections, %s.%d, %s, remove first connect",camera_id, channel, user_tag)
+            logger.warning("User connection limit reached for %s, removing oldest.", camera_tag)
             _, ws = self._camera_connect_map[camera_tag][user_tag].popitem(last=False)
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.close()
-            except Exception as err:  # pylint: disable=broad-exception-caught
+            except Exception as err:
                 logger.error("WebSocket close error: %s", err)
         return connection_id
 
     async def close_connection(
-        self, user_name: str, token_hash: str, camera_id: str, channel: int, cid: str
+            self, user_name: str, token_hash: str, camera_id: str, channel: int, cid: str, video_quality: int
     ):
         """Close video stream connection."""
-        camera_tag = f"{camera_id}.{channel}"
+        camera_tag = f"{camera_id}.{channel}.{video_quality}"
         user_tag = f"{user_name}.{token_hash}"
+
         if (
-            camera_tag not in self._camera_connect_map
-            or user_tag not in self._camera_connect_map[camera_tag]
-            or cid not in self._camera_connect_map[camera_tag][user_tag]
+                camera_tag not in self._camera_connect_map
+                or user_tag not in self._camera_connect_map[camera_tag]
+                or cid not in self._camera_connect_map[camera_tag][user_tag]
         ):
             return
-        logger.info("Close video stream connection, %s, %s, %s", camera_tag, user_tag, cid)
+
+        logger.info("Closing WS client: %s (ID: %s)", camera_tag, cid)
 
         try:
             ws = self._camera_connect_map[camera_tag][user_tag].pop(cid)
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.close()
-        except Exception as err:  # pylint: disable=broad-exception-caught
+        except Exception as err:
             logger.error("WebSocket close error: %s", err)
+
         if len(self._camera_connect_map[camera_tag][user_tag]) == 0:
             self._camera_connect_map[camera_tag].pop(user_tag, None)
+
+        # 如果该清晰度的所有用户都退出了
         if len(self._camera_connect_map[camera_tag]) == 0:
-            await manager.miot_service.stop_video_stream(camera_id, channel)
+            logger.info("No clients left for %s, stopping stream.", camera_tag)
+            await manager.miot_service.stop_video_stream(camera_id, channel, video_quality=video_quality)
             self._camera_connect_map.pop(camera_tag)
-            logger.info("No connection, stop video stream, %s.%d", camera_id, channel)
 
     async def __video_stream_callback(
-        self, did: str, data: bytes, ts: int, seq: int, channel: int
+            self, did: str, data: bytes, ts: int, seq: int, channel: int, video_quality: int = None
     ) -> None:
         """Video stream callback."""
-        # pylint: disable=unused-argument
-        camera_tag = f"{did}.{channel}"
-        if camera_tag not in self._camera_connect_map:
-            logger.error("No connection, %s.%d", did, channel)
-            # Stop camera stream
-            await manager.miot_service.stop_video_stream(did, channel)
+        if video_quality is None:
             return
-        for conn in self._camera_connect_map[camera_tag].values():
-            for ws in conn.values():
+
+        camera_tag = f"{did}.{channel}.{video_quality}"
+
+        # [核心修改] 静默处理孤儿数据
+        # 如果收到了数据，但在 _camera_connect_map 里找不到对应的 tag，说明连接已经关闭了
+        # 我们不在这里调用 stop，因为 close_connection 应该已经调用过了
+        # 避免日志刷屏和逻辑死循环
+        if camera_tag not in self._camera_connect_map:
+            # 可选：只打印一次 debug 或者完全忽略
+            # logger.debug("Dropping orphaned frame for %s", camera_tag)
+            return
+
+        for user_sessions in self._camera_connect_map[camera_tag].values():
+            for ws in user_sessions.values():
                 try:
                     await ws.send_bytes(data)
-                except Exception as err:  # pylint: disable=broad-exception-caught
+                except Exception as err:
                     logger.error("WebSocket send error: %s", err)
 
 
@@ -330,18 +333,22 @@ miot_video_stream_manager = MIoTVideoStreamManager()
 
 @router.websocket("/ws/video_stream")
 async def video_stream_websocket(
-    websocket: WebSocket,
-    camera_id: str,
-    channel: int,
-    video_quality: int = MIoTCameraVideoQuality.HIGH.value,
-    current_user: str = Depends(verify_websocket_token)
+        websocket: WebSocket,
+        camera_id: str,
+        channel: int,
+        video_quality: int = Query(default=MIoTCameraVideoQuality.HIGH.value),
+        current_user: str = Depends(verify_websocket_token)
 ):
-    """Video stream WebSocket."""
-    logger.warning(
-        "WebSocket connection request, %s, %s.%d %d", current_user, camera_id, channel, video_quality)
+    """Video stream WebSocket Endpoint."""
+    logger.info(
+        "WS Handshake: User=%s, Camera=%s, CH=%d, Quality=%d",
+        current_user, camera_id, channel, video_quality
+    )
+
     start_time: datetime = datetime.now()
     token_hash: str = str(hash(websocket.cookies.get("access_token")))
     cid: Optional[str] = None
+
     try:
         await websocket.accept()
         cid = await miot_video_stream_manager.new_connection(
@@ -350,23 +357,35 @@ async def video_stream_websocket(
             token_hash=token_hash,
             camera_id=camera_id,
             channel=channel,
-            video_quality=video_quality,)
+            video_quality=video_quality,
+        )
+
         while True:
             try:
                 message = await websocket.receive_text()
-                logger.info("Received message from client, %s", message)
-            except Exception as err:  # pylint: disable=broad-exception-caught
-                logger.error("WebSocket error: %s", err)
+                if message == "ping":
+                    await websocket.send_text("pong")
+            except Exception:
                 break
+
     except WebSocketDisconnect:
-        logger.warning("Client disconnected, %s.%d", camera_id, channel)
-    except Exception as err:  # pylint: disable=broad-exception-caught
-        logger.error("WebSocket error, %s", err)
-        await websocket.close(code=1011, reason=f"Server error: {str(err)}")
+        logger.warning("Client disconnected: %s, Q=%d", camera_id, video_quality)
+    except Exception as err:
+        logger.error("WebSocket error: %s", err)
+        try:
+            await websocket.close(code=1011, reason=f"Server error: {str(err)}")
+        except:
+            pass
     finally:
-        logger.info(
-            "Websocket connect duration[%.2fs], %s.%d",
-            (datetime.now() - start_time).total_seconds(), camera_id, channel)
         if cid:
             await miot_video_stream_manager.close_connection(
-                user_name=current_user, token_hash=token_hash,camera_id=camera_id, channel=channel, cid=cid)
+                user_name=current_user,
+                token_hash=token_hash,
+                camera_id=camera_id,
+                channel=channel,
+                cid=cid,
+                video_quality=video_quality
+            )
+
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.info("WS Session ended. Duration: %.2fs", duration)

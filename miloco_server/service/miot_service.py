@@ -6,7 +6,7 @@ MiOT service module
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Callable, Coroutine
 
 from miot.types import MIoTUserInfo, MIoTCameraInfo, MIoTDeviceInfo, MIoTManualSceneInfo
 
@@ -48,25 +48,23 @@ class MiotService:
             logger.info(
                 "process_xiaomi_home_callback code: %s, status: %s", code, state)
 
-            await self._miot_proxy.get_miot_auth_info(code=code,
-                                                              state=state)
+            await self._miot_proxy.get_miot_auth_info(code=code, state=state)
             await self._mcp_client_manager.init_miot_mcp_clients()
 
         except Exception as e:
             logger.error("Failed to process Xiaomi MiOT authorization code: %s", e)
             raise MiotServiceException(f"Failed to process Xiaomi MiOT authorization code: {str(e)}") from e
 
-
     async def refresh_miot_all_info(self) -> dict:
         """
         Refresh MiOT all information
-        
+
         Returns:
             dict: Dictionary containing result of each refresh operation
         """
         try:
             return await self._miot_proxy.refresh_miot_info()
-        except Exception as e: # pylint: disable=broad-exception-caught
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Failed to refresh MiOT all information: %s", e)
             raise MiotServiceException(f"Failed to refresh MiOT all information: {str(e)}") from e
 
@@ -177,8 +175,8 @@ class MiotService:
         """
         try:
             camera_dict: dict[
-                str,
-                MIoTCameraInfo] | None = await self._miot_proxy.get_cameras()
+                             str,
+                             MIoTCameraInfo] | None = await self._miot_proxy.get_cameras()
             if not camera_dict:
                 raise MiotServiceException("Failed to get MiOT camera list")
 
@@ -259,9 +257,9 @@ class MiotService:
         """
         try:
             scenes: dict[
-                str,
-                MIoTManualSceneInfo] | None = await self._miot_proxy.get_all_scenes(
-                )
+                        str,
+                        MIoTManualSceneInfo] | None = await self._miot_proxy.get_all_scenes(
+            )
 
             if scenes is None:
                 raise MiotServiceException("Failed to get MiOT scene list")
@@ -292,7 +290,9 @@ class MiotService:
             logger.error("Failed to send notification: %s", str(e))
             raise BusinessException(f"Failed to send notification: {str(e)}") from e
 
-    async def start_video_stream(self, camera_id: str, channel: int, callback , video_quality: int):
+    async def start_video_stream(self, camera_id: str, channel: int,
+                                 callback: Callable[[str, bytes, int, int, int], Coroutine],
+                                 video_quality: int):
         """
         Start video stream (business layer method)
 
@@ -300,12 +300,13 @@ class MiotService:
             camera_id: Camera device ID
             channel: Channel number
             callback: Video data callback function
+            video_quality: Requested video quality
 
         Raises:
             MiotServiceException: When startup fails
         """
         try:
-            logger.info("Starting video stream: camera_id=%s, channel=%s", camera_id, channel)
+            logger.info("Starting video stream: camera_id=%s, channel=%s, q=%d", camera_id, channel, video_quality)
             if callback:
                 await self._miot_proxy.start_camera_raw_stream(
                     camera_id, channel, callback, video_quality)
@@ -315,19 +316,21 @@ class MiotService:
             logger.error("Failed to start video stream: %s", e)
             raise MiotServiceException(f"Failed to start video stream: {str(e)}") from e
 
-    async def stop_video_stream(self, camera_id: str, channel: int):
+    async def stop_video_stream(self, camera_id: str, channel: int, video_quality: int = None):
         """
         Stop video stream (business layer method)
 
         Args:
             camera_id: Camera device ID
+            channel: Channel number
+            video_quality: (Optional) The quality of the stream to stop.
 
         Raises:
             MiotServiceException: When stopping fails
         """
         try:
-            logger.info("Stopping video stream: camera_id=%s", camera_id)
-            await self._miot_proxy.stop_camera_raw_stream(camera_id, channel)
+            logger.info("Stopping video stream: camera_id=%s, q=%s", camera_id, video_quality)
+            await self._miot_proxy.stop_camera_raw_stream(camera_id, channel, video_quality)
             logger.info("Video stream stopped successfully: camera_id=%s", camera_id)
         except Exception as e:
             logger.error("Failed to stop video stream: %s", e)

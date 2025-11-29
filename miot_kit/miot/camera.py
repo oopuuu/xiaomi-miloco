@@ -12,7 +12,7 @@ from ctypes import (
 )
 from pathlib import Path
 import platform
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 from aiocache import Cache, cached
 import aiofiles
 import yaml
@@ -31,7 +31,6 @@ from .types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
 
 #  level, msg
 _MIOT_CAMERA_LOG_HANDLER = CFUNCTYPE(None, c_int, c_char_p)
@@ -103,12 +102,12 @@ class MIoTCameraInstance:
     _decoders: List[MIoTMediaDecoder]
 
     def __init__(
-        self,
-        manager: "MIoTCamera",
-        frame_interval: int,
-        enable_hw_accel: bool,
-        camera_info: MIoTCameraInfo,
-        main_loop: Optional[asyncio.AbstractEventLoop] = None,
+            self,
+            manager: "MIoTCamera",
+            frame_interval: int,
+            enable_hw_accel: bool,
+            camera_info: MIoTCameraInfo,
+            main_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self._manager = manager
         self._main_loop = main_loop or asyncio.get_event_loop()
@@ -119,7 +118,7 @@ class MIoTCameraInstance:
         self._enable_hw_accel = enable_hw_accel
         self._callback_refs = {}
 
-        self._video_qualities = [MIoTCameraVideoQuality.LOW]
+        self._video_qualities = [1]  # Default to Low (1)
         self._pin_code = None
         self._enable_audio = False
         self._enable_reconnect = False
@@ -162,26 +161,39 @@ class MIoTCameraInstance:
         self._callbacks.clear()
 
     async def start_async(
-        self,
-        qualities: MIoTCameraVideoQuality | List[MIoTCameraVideoQuality] = MIoTCameraVideoQuality.LOW,
-        pin_code: Optional[str] = None,
-        enable_audio: bool = True,
-        enable_reconnect: bool = False,
-        enable_record: bool = False,
+            self,
+            qualities: Union[int, MIoTCameraVideoQuality, List[Union[int, MIoTCameraVideoQuality]]] = 1,
+            pin_code: Optional[str] = None,
+            enable_audio: bool = True,
+            enable_reconnect: bool = False,
+            enable_record: bool = False,
     ) -> None:
         """Start camera."""
         channel_count: int = self._camera_info.channel_count or 1
-        video_qualities: List
-        if isinstance(qualities, MIoTCameraVideoQuality):
-            # channel count > 1, use default quality foreach channel
-            _LOGGER.info("外部传入的视频质量, %d", self.camera_info.video_quality)
-            video_qualities = [2 for _ in range(channel_count)]
-        elif isinstance(qualities, List):
-            _LOGGER.info("外部传入的视频质量, %d", self.camera_info.video_quality)
-            video_qualities = [2 for _ in qualities]
+        video_qualities: List[int] = []
+
+        # [重要] 必须保留这段逻辑以支持直接传入 int 类型的清晰度
+        if isinstance(qualities, int):
+            _LOGGER.info("Use provided single quality (int): %d", qualities)
+            video_qualities = [qualities for _ in range(channel_count)]
+
+        elif isinstance(qualities, MIoTCameraVideoQuality):
+            _LOGGER.info("Use provided single quality (Enum): %d", qualities.value)
+            video_qualities = [qualities.value for _ in range(channel_count)]
+
+        elif isinstance(qualities, list):
+            _LOGGER.info("Use provided quality list")
+            for q in qualities:
+                if isinstance(q, int):
+                    video_qualities.append(q)
+                elif hasattr(q, "value"):
+                    video_qualities.append(q.value)
+                else:
+                    video_qualities.append(1)  # fallback
         else:
-            _LOGGER.error("invalid camera video qualities, %s", qualities)
-            raise MIoTCameraError(f"invalid camera video qualities, {qualities}")
+            _LOGGER.error("Invalid qualities type: %s, fallback to LOW(1)", type(qualities))
+            video_qualities = [1 for _ in range(channel_count)]
+
         video_qualities.append(0)
         self._pin_code = pin_code
         self._video_qualities = video_qualities
@@ -206,7 +218,6 @@ class MIoTCameraInstance:
         # Register status callback.
         c_callback = _MIOT_CAMERA_ON_STATUS_CHANGED(self.__on_status_changed)
         result: int = self._lib_miot_camera.miot_camera_register_status_changed(self._c_instance, c_callback)
-        # MUST add to callback refs, otherwise it will be freed.
         self._callback_refs["status"] = c_callback
         _LOGGER.info("register status changed, %s, %s", self._did, result)
 
@@ -216,7 +227,6 @@ class MIoTCameraInstance:
 
     async def stop_async(self) -> None:
         """Stop camera."""
-        # Cancel reconnect task if exists.
         self._enable_reconnect = False
         if self._reconnect_timer:
             self._reconnect_timer.cancel()
@@ -226,7 +236,6 @@ class MIoTCameraInstance:
         result: int = await self._main_loop.run_in_executor(
             None, self._lib_miot_camera.miot_camera_stop, self._c_instance
         )
-        # Stop decoders
         for decoder in self._decoders:
             decoder.stop()
         self._decoders.clear()
@@ -242,7 +251,7 @@ class MIoTCameraInstance:
         return MIoTCameraStatus(result)
 
     async def register_status_changed_async(
-        self, callback: Callable[[str, MIoTCameraStatus], Coroutine], multi_reg: bool = False
+            self, callback: Callable[[str, MIoTCameraStatus], Coroutine], multi_reg: bool = False
     ) -> int:
         """Register camera status changed callback.
         async def on_status_changed_async(did: str, status: int)
@@ -261,7 +270,7 @@ class MIoTCameraInstance:
         self._callbacks["status"].pop(str(reg_id), None)
 
     async def register_raw_video_async(
-        self, callback: Callable[[str, bytes, int, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, callback: Callable[[str, bytes, int, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
     ) -> int:
         """Register camera raw stream callback.
         async def on_raw_video_async(did: str, data: bytes, ts: int, seq: int, channel: int)
@@ -284,7 +293,7 @@ class MIoTCameraInstance:
         await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
 
     async def register_raw_audio_async(
-        self, callback: Callable[[str, bytes, int, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, callback: Callable[[str, bytes, int, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
     ) -> int:
         """Register camera raw audio callback.
         async def on_raw_audio_async(did: str, data: bytes, ts: int, seq: int, channel: int)
@@ -307,7 +316,7 @@ class MIoTCameraInstance:
         await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
 
     async def register_decode_jpg_async(
-        self, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
     ) -> int:
         """Register camera decode jpg callback.
         async def on_decode_jpg_async(did: str, data: bytes, ts: int, channel: int)
@@ -321,7 +330,7 @@ class MIoTCameraInstance:
         self._callbacks[reg_key][str(reg_id)] = callback
         return reg_id
 
-    async def unregister_decode_jpg_async(self,  channel: int = 0, reg_id: int = 0) -> None:
+    async def unregister_decode_jpg_async(self, channel: int = 0, reg_id: int = 0) -> None:
         """Unregister camera decode jpg callback."""
         await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
         reg_key: str = f"decode_jpg.{channel}"
@@ -330,7 +339,7 @@ class MIoTCameraInstance:
         self._callbacks[reg_key].pop(str(reg_id), None)
 
     async def register_decode_pcm_async(
-        self, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
     ) -> int:
         """Register camera decode pcm callback.
         async def on_decode_pcm_async(did: str, data: bytes, ts: int, channel: int)
@@ -393,7 +402,6 @@ class MIoTCameraInstance:
                 await self.__unregister_raw_data_async(channel)
 
     async def __try_start_async(self) -> None:
-        _LOGGER.info("已经__try_start_async try start camera, %s %s", self._did, self._video_qualities)
         # Cancel reconnect task if exists.
         if self._reconnect_timer:
             self._reconnect_timer.cancel()
@@ -402,7 +410,7 @@ class MIoTCameraInstance:
         result: int = await self._main_loop.run_in_executor(
             None, self._lib_miot_camera.miot_camera_start, self._c_instance,
             byref(_MIoTCameraConfigC(
-                (c_uint8 * ((self.camera_info.channel_count or 1)+1))(*self._video_qualities),
+                (c_uint8 * ((self.camera_info.channel_count or 1) + 1))(*self._video_qualities),
                 self._enable_audio,
                 self._pin_code.encode("utf-8") if self._pin_code else None)
             )
@@ -505,9 +513,13 @@ class MIoTCameraInstance:
 
 
 def _load_dynamic_lib():
-    system = platform.system().lower()   # 'linux', 'darwin', 'windows'
+    system = platform.system().lower()  # 'linux', 'darwin', 'windows'
     machine = platform.machine().lower()  # 'x86_64', 'arm64', 'aarch64', 'i386'
     lib_path = Path(__file__).parent / "libs"
+
+    # [清理] 移除了 USE_AUX_LIB 逻辑，直接加载原版库
+    lib_name = "libmiot_camera_lite"
+
     if system == "linux":
         # linux
         if machine in ("x86_64", "amd64"):
@@ -521,7 +533,7 @@ def _load_dynamic_lib():
             lib_path = lib_path / "linux" / "arm"
         else:
             raise RuntimeError(f"unsupported Linux architecture: {machine}")
-        lib_path = lib_path / "libmiot_camera_lite.so"
+        lib_path = lib_path / f"{lib_name}.so"
 
     elif system == "darwin":
         # macOS
@@ -533,7 +545,7 @@ def _load_dynamic_lib():
             lib_path = lib_path / system / "arm64"
         else:
             raise RuntimeError(f"unsupported macOS architecture: {machine}")
-        lib_path = lib_path / "libmiot_camera_lite.dylib"
+        lib_path = lib_path / f"{lib_name}.dylib"
 
     elif system == "windows":
         if machine in ("x86_64", "amd64"):
@@ -544,7 +556,7 @@ def _load_dynamic_lib():
             lib_path = lib_path / system / "arm64"
         else:
             raise RuntimeError(f"Unsupported Windows architecture: {machine}")
-        lib_path = lib_path / "miot_camera_lite.dll"
+        lib_path = lib_path / f"{lib_name.replace('lib', '')}.dll"
     else:
         raise RuntimeError(f"unsupported system: {system}")
 
@@ -678,27 +690,25 @@ class MIoTCamera:
         self._lib_miot_camera.miot_camera_update_access_token(self._access_token.encode("utf-8"))
 
     async def create_camera_async(
-        self,
-        camera_info: MIoTCameraInfo | Dict,
-        frame_interval: Optional[int] = None,
-        enable_hw_accel: Optional[bool] = None,
+            self,
+            camera_info: MIoTCameraInfo | Dict,
+            frame_interval: Optional[int] = None,
+            enable_hw_accel: Optional[bool] = None,
     ) -> MIoTCameraInstance:
         """Create camera."""
         camera: MIoTCameraInfo = (
             MIoTCameraInfo(**camera_info) if isinstance(camera_info, Dict) else camera_info.model_copy()
         )
         did: str = camera.did
-        if did in self._camera_map:
-            _LOGGER.info("camera already exists")
-            return self._camera_map[did]
-        self._camera_map[did] = MIoTCameraInstance(
+        # 这里不要放入 _camera_map，否则多实例会覆盖 key
+        instance = MIoTCameraInstance(
             manager=self,
             frame_interval=frame_interval or self._frame_interval,
             enable_hw_accel=enable_hw_accel or self._enable_hw_accel,
             camera_info=camera,
             main_loop=self._main_loop
         )
-        return self._camera_map[did]
+        return instance
 
     async def get_camera_instance_async(self, did: str) -> Optional[MIoTCameraInstance]:
         """Get camera instance."""
@@ -713,13 +723,17 @@ class MIoTCamera:
         camera = self._camera_map.pop(did)
         return await camera.destroy_async()
 
+    # 注意：原本的 start_camera_async 等方法都是通过 did 查 map。
+    # 由于我们现在绕过了 map，proxy 层直接持有 instance 并调用 instance.start_async
+    # 所以下面这些便捷方法可能对多路流不再有效，但这不影响 Proxy 的工作。
+
     async def start_camera_async(
-        self,
-        did: str,
-        pin_code: Optional[str] = None,
-        qualities: MIoTCameraVideoQuality | List[MIoTCameraVideoQuality] = MIoTCameraVideoQuality.LOW,
-        enable_audio: bool = False,
-        enable_reconnect: bool = False,
+            self,
+            did: str,
+            pin_code: Optional[str] = None,
+            qualities: MIoTCameraVideoQuality | List[MIoTCameraVideoQuality] = MIoTCameraVideoQuality.LOW,
+            enable_audio: bool = False,
+            enable_reconnect: bool = False,
     ) -> None:
         """Start camera."""
         # Check.
@@ -756,7 +770,7 @@ class MIoTCamera:
         return result.decode("utf-8")
 
     async def register_status_changed_async(
-        self, did: str, callback: Callable[[str, MIoTCameraStatus], Coroutine], multi_reg: bool = False
+            self, did: str, callback: Callable[[str, MIoTCameraStatus], Coroutine], multi_reg: bool = False
     ) -> int:
         """Register camera status changed.
         async def on_status_changed_async(did: str, status: int)
@@ -774,11 +788,11 @@ class MIoTCamera:
         return await self._camera_map[did].unregister_status_changed_async(reg_id=reg_id)
 
     async def register_raw_video_async(
-        self,
-        did: str,
-        callback: Callable[[str, bytes, int, int, int], Coroutine],
-        channel: int = 0,
-        multi_reg: bool = False
+            self,
+            did: str,
+            callback: Callable[[str, bytes, int, int, int], Coroutine],
+            channel: int = 0,
+            multi_reg: bool = False
     ) -> int:
         """Register raw video.
         async def on_raw_video_async(did: str, data: bytes, ts: int, seq: int, channel: int)
@@ -806,11 +820,11 @@ class MIoTCamera:
         return await self._camera_map[did].unregister_raw_video_async(channel=channel, reg_id=reg_id)
 
     async def register_raw_audio_async(
-        self,
-        did: str,
-        callback: Callable[[str, bytes, int, int, int], Coroutine],
-        channel: int = 0,
-        multi_reg: bool = False
+            self,
+            did: str,
+            callback: Callable[[str, bytes, int, int, int], Coroutine],
+            channel: int = 0,
+            multi_reg: bool = False
     ) -> int:
         """Register raw audio.
         async def on_raw_audio_async(did: str, data: bytes, ts: int, seq: int, channel: int)
@@ -838,7 +852,8 @@ class MIoTCamera:
         return await self._camera_map[did].unregister_raw_audio_async(channel=channel, reg_id=reg_id)
 
     async def register_decode_jpg_async(
-        self, did: str, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, did: str, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0,
+            multi_reg: bool = False
     ) -> int:
         """Register decode jpg.
         async def on_decode_jpg_async(did: str, data: bytes, ts: int, channel: int)
@@ -864,7 +879,8 @@ class MIoTCamera:
         return await self._camera_map[did].unregister_decode_jpg_async(channel=channel, reg_id=reg_id)
 
     async def register_decode_pcm_async(
-        self, did: str, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+            self, did: str, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0,
+            multi_reg: bool = False
     ) -> int:
         """Register decode pcm.
         async def on_decode_pcm_async(did: str, data: bytes, ts: int, channel: int)
