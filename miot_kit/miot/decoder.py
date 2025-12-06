@@ -69,25 +69,34 @@ class MIoTMediaRingBuffer():
             self._cond.notify()
 
     def step(
-        self,
-        on_video_frame: Callable[[MIoTCameraFrameData], None],
-        on_audio_frame: Callable[[MIoTCameraFrameData], None],
-        timeout: float = 0.2
+            self,
+            on_video_frame: Callable[[MIoTCameraFrameData], None],
+            on_audio_frame: Callable[[MIoTCameraFrameData], None],
+            timeout: float = 0.2
     ) -> None:
-        on_frame: Callable[[MIoTCameraFrameData], None] = on_video_frame
-        frame_data: Optional[MIoTCameraFrameData] = None
-        # get frame
+        video_data: Optional[MIoTCameraFrameData] = None
+        audio_data: Optional[MIoTCameraFrameData] = None
+
         with self._cond:
-            if self._video_buffer:
-                frame_data = self._video_buffer.popleft()
-            elif self._audio_buffer:
-                frame_data = self._audio_buffer.popleft()
-                on_frame = on_audio_frame
+            # 策略修改：只要有音频就优先处理音频
+            # 因为音频解码极快且对延迟敏感，视频解码慢
+            if self._audio_buffer:
+                audio_data = self._audio_buffer.popleft()
+            elif self._video_buffer:
+                video_data = self._video_buffer.popleft()
             else:
                 self._cond.wait(timeout=timeout)
-        # handle frame
-        if frame_data:
-            on_frame(frame_data)
+                # 等待后再次检查
+                if self._audio_buffer:
+                    audio_data = self._audio_buffer.popleft()
+                elif self._video_buffer:
+                    video_data = self._video_buffer.popleft()
+
+        # 在锁外执行回调
+        if audio_data:
+            on_audio_frame(audio_data)
+        elif video_data:
+            on_video_frame(video_data)
 
     def stop(self):
         del self._cond
@@ -227,22 +236,58 @@ class MIoTMediaDecoder(threading.Thread):
 
     def _on_audio_callback(self, frame_data: MIoTCameraFrameData) -> None:
         if not self._audio_decoder:
-            # Create audio decoder
+            # --- [修复] 添加对 G.711A/U 的支持 ---
+            codec_name = None
             if frame_data.codec_id == MIoTCameraCodec.AUDIO_OPUS:
-                self._audio_decoder = AudioCodecContext.create("opus", "r")
-            self._resampler = AudioResampler(format="s16", layout="mono", rate=16000)
-            _LOGGER.info("audio decoder created, %s", frame_data.codec_id)
-        pkt = Packet(frame_data.data)
-        frames: List[AudioFrame] = self._audio_decoder.decode(pkt)  # type: ignore
-        pcm_bytes: bytes = b""
-        for frame in frames:
-            rs_frames = self._resampler.resample(frame)
-            for rs_frame in rs_frames:
-                pcm_bytes += rs_frame.to_ndarray().tobytes()
-        self._main_loop.call_soon_threadsafe(
-            self._main_loop.create_task,
-            self._audio_callback(pcm_bytes, frame_data.timestamp, frame_data.channel)
-        )
+                codec_name = "opus"
+            elif frame_data.codec_id == MIoTCameraCodec.AUDIO_G711A:
+                codec_name = "alaw"  # FFmpeg 中 G.711 A-law 对应的名称
+            elif frame_data.codec_id == MIoTCameraCodec.AUDIO_G711U:
+                codec_name = "mulaw"  # FFmpeg 中 G.711 mu-law 对应的名称
+
+            if codec_name:
+                try:
+                    # 创建解码器上下文
+                    self._audio_decoder = AudioCodecContext.create(codec_name, "r")
+                    _LOGGER.info("Audio decoder created: %s (%s)", codec_name, frame_data.codec_id)
+                except Exception as e:
+                    _LOGGER.error("Failed to create audio codec %s: %s", codec_name, e)
+                    return
+            else:
+                _LOGGER.error("Unsupported audio codec id: %s", frame_data.codec_id)
+                return
+
+            # 初始化重采样器：转为单声道 16000Hz s16 格式 (这是大多数播放器通用的格式)
+            try:
+                self._resampler = AudioResampler(format="s16", layout="mono", rate=16000)
+            except Exception as e:
+                _LOGGER.error("Failed to create resampler: %s", e)
+                return
+
+        # 开始解码
+        try:
+            # 必须使用 Packet 封装
+            pkt = Packet(frame_data.data)
+
+            if self._audio_decoder:
+                frames: List[AudioFrame] = self._audio_decoder.decode(pkt)
+                pcm_bytes: bytes = b""
+
+                for frame in frames:
+                    # 重采样
+                    rs_frames = self._resampler.resample(frame)
+                    for rs_frame in rs_frames:
+                        pcm_bytes += rs_frame.to_ndarray().tobytes()
+
+                # 回调发送 PCM 数据
+                if pcm_bytes and self._audio_callback:
+                    self._main_loop.call_soon_threadsafe(
+                        self._main_loop.create_task,
+                        self._audio_callback(pcm_bytes, frame_data.timestamp, frame_data.channel)
+                    )
+        except Exception as e:
+            # 捕获解码错误，防止线程崩溃
+            _LOGGER.error("Decode audio error: %s", e)
 
 
 class MIoTMediaRecorder(threading.Thread):

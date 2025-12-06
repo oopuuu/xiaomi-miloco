@@ -303,29 +303,31 @@ class MIoTVideoStreamManager:
             self._camera_connect_map.pop(camera_tag)
 
     async def __video_stream_callback(
-            self, did: str, data: bytes, ts: int, seq: int, channel: int, video_quality: int = None
-    ) -> None:
-        """Video stream callback."""
-        if video_quality is None:
-            return
-
+            self, did: str, data: bytes, ts: int, seq: int, channel: int,
+            video_quality: int, packet_type: int = 1  # <--- [新增参数] 默认为1(视频)
+    ):
+        """
+        回调函数：负责向 WebSocket 发送数据
+        packet_type: 1=视频, 2=音频
+        """
         camera_tag = f"{did}.{channel}.{video_quality}"
 
-        # [核心修改] 静默处理孤儿数据
-        # 如果收到了数据，但在 _camera_connect_map 里找不到对应的 tag，说明连接已经关闭了
-        # 我们不在这里调用 stop，因为 close_connection 应该已经调用过了
-        # 避免日志刷屏和逻辑死循环
-        if camera_tag not in self._camera_connect_map:
-            # 可选：只打印一次 debug 或者完全忽略
-            # logger.debug("Dropping orphaned frame for %s", camera_tag)
-            return
+        # [关键修改] 构建带头部的包: Type(1 byte) + Payload
+        # to_bytes(1, ...) 生成 b'\x01'，to_bytes(1, ...) 生成 b'\x02'
+        header = packet_type.to_bytes(1, 'big')
+        packet = header + data
 
-        for user_sessions in self._camera_connect_map[camera_tag].values():
-            for ws in user_sessions.values():
-                try:
-                    await ws.send_bytes(data)
-                except Exception as err:
-                    logger.error("WebSocket send error: %s", err)
+        # 获取该相机组下的所有连接
+        if camera_tag in self._camera_connect_map:
+            user_map = self._camera_connect_map[camera_tag]
+            for user_tag, connections in user_map.items():
+                for cid, ws in list(connections.items()):
+                    try:
+                        # 发送带头部的二进制包
+                        await ws.send_bytes(packet)
+                    except Exception as e:
+                        logger.error(f"Send stream error: {e}")
+                        # 可以在这里处理断开连接的逻辑
 
 
 miot_video_stream_manager = MIoTVideoStreamManager()

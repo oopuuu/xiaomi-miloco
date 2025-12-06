@@ -456,7 +456,19 @@ class MIoTCameraInstance:
     def __on_raw_data(self, frame_header_ptr: Any, data: bytes) -> None:
         """Callback for raw data."""
         frame_header: _MIoTCameraFrameHeaderC = frame_header_ptr.contents
-        codec_id: MIoTCameraCodec = MIoTCameraCodec(frame_header.codec_id)
+        # --- [新增] 强制打印调试信息 ---
+        # 打印：CodecID(原始整数), 帧类型, 长度, 时间戳
+        # 注意：这里直接打印 int 类型的 codec_id，防止 Enum 转换报错
+        raw_codec_id = frame_header.codec_id
+        # _LOGGER.info(f"DEBUG: Rx Packet -> Codec: {raw_codec_id}, Type: {frame_header.frame_type}, Len: {frame_header.length}")
+        # ----------------------------
+
+        try:
+            codec_id: MIoTCameraCodec = MIoTCameraCodec(raw_codec_id)
+        except ValueError:
+            # 如果是未知的编码格式，Enum 转换会报错，这里捕获它
+            _LOGGER.error(f"CRITICAL: Unknown Codec ID received: {raw_codec_id}")
+            return
         channel: int = frame_header.channel
         frame_data = MIoTCameraFrameData(
             codec_id=codec_id,
