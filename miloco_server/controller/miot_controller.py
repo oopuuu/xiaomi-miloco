@@ -11,7 +11,7 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Optional
 from functools import partial
-from fastapi import APIRouter, Depends, WebSocket, Query
+from fastapi import APIRouter, Depends, WebSocket, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect, WebSocketState
 
@@ -89,7 +89,30 @@ async def get_miot_login_status(current_user: str = Depends(verify_token)):
         data=result
     )
 
+@router.get("/internal/stream/start/{did}")
+async def internal_stream_start(did: str, video_quality: int = 2):
+    """
+    [Hook] 当 MediaMTX 收到 RTSP 请求时，会调用此接口
+    """
+    logger.info(f"[On-Demand] Trigger start for {did}")
+    # 这里不需要回调，因为是直接推流到 MediaMTX
+    # 默认请求高清 (Q=2)，你可以根据需要写死或通过参数传递
+    await manager.miot_service.start_video_stream(
+        camera_id=did,
+        channel=0,
+        callback=None,
+        video_quality=video_quality
+    )
+    return {"status": "ok"}
 
+@router.get("/internal/stream/stop/{did}")
+async def internal_stream_stop(did: str):
+    """
+    [Hook] 当没人观看 RTSP 时，会调用此接口
+    """
+    logger.info(f"[On-Demand] Trigger stop for {did}")
+    await manager.miot_service.stop_video_stream(camera_id=did, channel=0)
+    return {"status": "ok"}
 @router.get(path="/user_info", summary="Get MiOT user information", response_model=NormalResponse)
 async def get_miot_user_info(current_user: str = Depends(verify_token)):
     """Get MiOT user information"""

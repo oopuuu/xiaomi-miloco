@@ -22,6 +22,7 @@ from miloco_server.middleware.exceptions import (
 )
 from miloco_server.utils.default_action import DefaultPresetActionManager
 from miloco_server.mcp.mcp_client_manager import MCPClientManager
+from miloco_server.utils.ffmpeg_streamer import FFmpegStreamer
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class MiotService:
         self._miot_proxy = miot_proxy
         self._mcp_client_manager = mcp_client_manager
         self._default_preset_action_manager = default_preset_action_manager
+        self._streamers: dict[str, FFmpegStreamer] = {}
 
     @property
     def miot_client(self):
@@ -155,66 +157,45 @@ class MiotService:
 
     # [关键修改] 启动流
     async def start_video_stream(self, camera_id: str, channel: int,
-                                 callback: Callable[..., Coroutine],
+                                 callback: Callable[..., Coroutine],  # 保留兼容
                                  video_quality: int):
-        """
-        Start video stream (business layer method)
-        """
         try:
-            logger.info("Starting video stream: camera_id=%s, channel=%s, q=%d", camera_id, channel, video_quality)
+            logger.info(f"Starting Local RTSP for {camera_id}...")
 
-            # 1. 检查是否存在，且是否需要升级画质
+            # 1. 确保 Camera Instance 存在 (同之前逻辑)
             camera_instance = self._miot_proxy.get_camera_instance(camera_id)
-
-            # 如果存在，判断是否是低清流 (refresh_cameras 默认是 1)
-            # 这里做一个简单假设：如果请求 >1 而实例已存在，为了保险起见我们销毁重建
-            # (除非我们能确认当前就是高清，这里简化逻辑：只要请求高清就重建)
             if camera_instance and video_quality > 1:
-                logger.info(f"Upgrading stream quality to {video_quality}. Re-creating camera proxy...")
                 await self._miot_proxy.destroy_camera_proxy(camera_id)
                 camera_instance = None
-
-            # 2. 如果实例不存在，创建
             if not camera_instance:
                 await self._miot_proxy.create_camera_proxy(camera_id, target_quality=video_quality)
                 camera_instance = self._miot_proxy.get_camera_instance(camera_id)
 
-            if not camera_instance:
-                raise MiotServiceException(f"Camera instance not found/created: {camera_id}")
+            # 2. 启动内部 Streamer
+            if camera_id not in self._streamers:
+                streamer = FFmpegStreamer(camera_id)
+                streamer.start(video_codec="hevc")  # 假设是 HEVC
+                self._streamers[camera_id] = streamer
 
-            if callback:
-                # 使用 partial 注入包类型：1=视频, 2=音频
-                video_cb = partial(callback, packet_type=1)
-                audio_cb = partial(callback, packet_type=2)
+            # 3. 定义数据回调：直接喂给 Streamer
+            # 注意：p_type=1 是视频，2 是音频
+            async def on_video(did, data, ts, seq, channel):
+                if did in self._streamers: self._streamers[did].push_video(data)
 
-                # 注册视频回调
-                await camera_instance.register_raw_video_async(
-                    callback=video_cb,
-                    channel=channel,
-                    multi_reg=True
-                )
-                logger.info("Registered raw video callback")
+            async def on_audio(did, data, ts, seq, channel):
+                if did in self._streamers: self._streamers[did].push_audio(data)
 
-                # 注册音频回调 (G.711)
-                await camera_instance.register_raw_audio_async(
-                    callback=audio_cb,
-                    channel=channel,
-                    multi_reg=True
-                )
-                logger.info("Registered raw audio callback")
+            # 4. 注册到底层 (multi_reg=True 允许多个接收者)
+            # 注意：这里我们不需要 partial 了，直接定义简单函数即可
+            await camera_instance.register_raw_video_async(on_video, channel, True)
+            await camera_instance.register_raw_audio_async(on_audio, channel, True)
 
-                # 再次启动以确保音频开启
-                await camera_instance.start_async(
-                    qualities=video_quality,
-                    enable_audio=True,
-                    enable_reconnect=True
-                )
-            else:
-                logger.info("No callback provided.")
+            await camera_instance.start_async(qualities=video_quality, enable_audio=True, enable_reconnect=True)
+
+            logger.info(f"RTSP Ready at: rtsp://YOUR_MILOCO_IP:8554/{camera_id}")
 
         except Exception as e:
-            logger.error("Failed to start video stream: %s", e)
-            raise MiotServiceException(f"Failed to start video stream: {str(e)}") from e
+            logger.error(f"Stream start failed: {e}")
 
     async def stop_video_stream(self, camera_id: str, channel: int, video_quality: int = None):
         try:

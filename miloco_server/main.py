@@ -15,6 +15,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from miloco_server.utils.mediamtx import rtsp_server
 
 from miloco_server.config import APP_CONFIG, IMAGE_DIR, SERVER_CONFIG, STATIC_DIR
 from miloco_server.controller import (
@@ -80,7 +81,7 @@ async def spa_handler(full_path: str):
 async def startup_event():
     """Application initialization operations on startup"""
     logger.info("Initializing application...")
-
+    rtsp_server.start()
     try:
         init_database()
         logger.info("Database initialization completed")
@@ -101,6 +102,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup operations when application shuts down"""
+    rtsp_server.stop()
     logger.info("Application is shutting down...")
     logger.info("Application has been shut down")
 

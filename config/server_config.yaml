@@ -24,6 +24,10 @@ server:
   enable_console_logging: true
   enable_file_logging: true
 
+# RTSP server configuration
+rtsp:
+  port: 8003
+
 # Application information configuration
 app:
   title: "Miloco server"

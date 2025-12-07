@@ -62,6 +62,14 @@ SERVER_CONFIG = {
     "ssl_keyfile": CERT_DIR / "key.pem",
 }
 
+# [新增] RTSP Configuration
+# 优先级：环境变量 (RTSP_PORT) > 配置文件 (rtsp.port) > 默认值 (8554)
+# 使用 .get() 方法防止配置文件中缺少 rtsp 字段导致报错
+RTSP_PORT = str(
+    os.getenv("RTSP_PORT") or
+    _config.get("rtsp", {}).get("port", "8554")
+)
+
 # Application information configuration
 APP_CONFIG = {
     "title": _config["app"]["title"],
