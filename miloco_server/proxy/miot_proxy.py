@@ -57,17 +57,14 @@ class MiotProxy:
     def miot_client(self) -> MIoTClient:
         return self._miot_client
 
-    # [Core] 获取实例
     def get_camera_instance(self, did: str) -> Optional[MIoTCameraInstance]:
         if did in self._camera_img_managers:
             return self._camera_img_managers[did].miot_camera_instance
         return None
 
-    # [Core] 获取管理器 (用于检查当前画质)
     def get_camera_vision_handler(self, did: str) -> Optional[CameraVisionHandler]:
         return self._camera_img_managers.get(did)
 
-    # [Core] 销毁实例
     async def destroy_camera_proxy(self, did: str):
         if did in self._camera_img_managers:
             logger.info(f"Destroying camera proxy for {did}...")
@@ -96,46 +93,56 @@ class MiotProxy:
 
     async def refresh_miot_info(self) -> dict:
         result = {"cameras": False, "scenes": False, "user_info": False, "devices": False}
-        camera_info_dict = await self.refresh_cameras()
-        result["cameras"] = camera_info_dict is not None
-        await asyncio.gather(
+
+        results = await asyncio.gather(
+            self.refresh_cameras(),
             self.refresh_scenes(),
             self.refresh_user_info(),
-            self.refresh_devices()
+            self.refresh_devices(),
+            return_exceptions=True
         )
-        result["scenes"] = True
-        result["user_info"] = True
-        result["devices"] = True
+
+        result["cameras"] = not isinstance(results[0], Exception) and results[0] is not None
+        result["scenes"] = not isinstance(results[1], Exception) and results[1] is not None
+        result["user_info"] = not isinstance(results[2], Exception) and results[2] is not None
+        result["devices"] = not isinstance(results[3], Exception) and results[3] is not None
+
         logger.info("MiOT info refresh completed: %s", result)
         return result
 
     def init_miot_info_dict(self):
-        self._camera_info_dict: dict[str, MIoTCameraInfo] = {
-            did: MIoTCameraInfo.model_validate(camera_info)
-            for did, camera_info in json.loads(self._kv_dao.get(DeviceInfoKeys.CAMERA_INFO_KEY) or "{}").items()}
-        self._device_info_dict: dict[str, MIoTDeviceInfo] = {
-            did: MIoTDeviceInfo.model_validate(device_info)
-            for did, device_info in json.loads(self._kv_dao.get(DeviceInfoKeys.DEVICE_INFO_KEY) or "{}").items()}
-        self._scene_info_dict: dict[str, MIoTManualSceneInfo] = {
-            scene_id: MIoTManualSceneInfo.model_validate(scene_info)
-            for scene_id, scene_info in json.loads(self._kv_dao.get(DeviceInfoKeys.SCENE_INFO_KEY) or "{}").items()}
+        try:
+            self._camera_info_dict: dict[str, MIoTCameraInfo] = {
+                did: MIoTCameraInfo.model_validate(camera_info)
+                for did, camera_info in json.loads(self._kv_dao.get(DeviceInfoKeys.CAMERA_INFO_KEY) or "{}").items()}
 
-        user_info_str = self._kv_dao.get(DeviceInfoKeys.USER_INFO_KEY)
-        self._user_info = MIoTUserInfo.model_validate_json(user_info_str) if user_info_str else None
-        oauth_info_str = self._kv_dao.get(AuthConfigKeys.MIOT_TOKEN_INFO_KEY)
-        self._oauth_info = MIoTOauthInfo.model_validate_json(oauth_info_str) if oauth_info_str else None
+            self._device_info_dict: dict[str, MIoTDeviceInfo] = {
+                did: MIoTDeviceInfo.model_validate(device_info)
+                for did, device_info in json.loads(self._kv_dao.get(DeviceInfoKeys.DEVICE_INFO_KEY) or "{}").items()}
+
+            self._scene_info_dict: dict[str, MIoTManualSceneInfo] = {
+                scene_id: MIoTManualSceneInfo.model_validate(scene_info)
+                for scene_id, scene_info in json.loads(self._kv_dao.get(DeviceInfoKeys.SCENE_INFO_KEY) or "{}").items()}
+
+            user_info_str = self._kv_dao.get(DeviceInfoKeys.USER_INFO_KEY)
+            self._user_info = MIoTUserInfo.model_validate_json(user_info_str) if user_info_str else None
+
+            oauth_info_str = self._kv_dao.get(AuthConfigKeys.MIOT_TOKEN_INFO_KEY)
+            self._oauth_info = MIoTOauthInfo.model_validate_json(oauth_info_str) if oauth_info_str else None
+        except Exception as e:
+            logger.error(f"Failed to load cached info from KV: {e}")
+            self._camera_info_dict = {}
+            self._device_info_dict = {}
+            self._scene_info_dict = {}
+            self._user_info = None
+            self._oauth_info = None
 
     def get_recent_camera_img(self, camera_id: str, channel: int, recent_count: int) -> CameraImgSeq | None:
         if camera_id in self._camera_img_managers:
             return self._camera_img_managers[camera_id].get_recents_camera_img(channel, recent_count)
         return None
 
-    # ==========================================================================
-    #  核心流控制逻辑
-    # ==========================================================================
-
     async def create_camera_proxy(self, did: str, target_quality: int = None):
-        """Ensure camera instance is created."""
         if did in self._camera_img_managers:
             return
 
@@ -153,7 +160,6 @@ class MiotProxy:
 
     async def _master_stream_callback(self, did: str, data: bytes, ts: int, seq: int, channel: int):
         if did in self._stream_subscribers:
-            # 调用列表副本防止迭代时修改
             subscribers = list(self._stream_subscribers[did])
             for callback in subscribers:
                 try:
@@ -161,7 +167,6 @@ class MiotProxy:
                 except Exception as e:
                     logger.error("Error in subscriber callback for %s: %s", did, e)
 
-    # [新增] 哑音频回调：专门用于吃掉音频数据，防止 Buffer 溢出
     async def _dummy_audio_callback(self, did: str, data: bytes, ts: int, seq: int, channel: int):
         pass
 
@@ -174,8 +179,6 @@ class MiotProxy:
 
     async def _on_device_status_changed(self, did: str, status: MIoTCameraStatus):
         if did in self._camera_info_dict:
-            # [修复] 放宽检查条件，只要状态码 > 0 (或者特定的几个状态) 就认为是在线
-            # 日志里出现了 status=4，这里直接判定非 0 即在线
             if status.value > 0:
                 self._camera_info_dict[did].online = True
                 self._camera_info_dict[did].camera_status = status
@@ -197,11 +200,8 @@ class MiotProxy:
         if camera_instance is not None:
             await camera_instance.register_status_changed_async(self._on_device_status_changed)
 
-            # [关键] 必须开启音频 enable_audio=True
             await camera_instance.start_async(enable_reconnect=True, qualities=quality_val, enable_audio=True)
 
-            # [关键修复] 注册音频回调，防止数据堆积导致断连
-            # 即使没有客户端订阅，我们也注册一个空回调来消耗数据
             await camera_instance.register_raw_audio_async(self._dummy_audio_callback, 0)
 
             camera_img_manager = CameraVisionHandler(
@@ -222,6 +222,10 @@ class MiotProxy:
             logger.error("Failed to get camera instance: %s", e)
             return None
 
+    # ==========================================================================
+    #  Getters & Refreshers
+    # ==========================================================================
+
     async def get_cameras(self) -> dict[str, MIoTCameraInfo]:
         if not self._camera_info_dict:
             await self.refresh_cameras()
@@ -233,53 +237,41 @@ class MiotProxy:
             cameras = await self._miot_client.get_cameras_async()
             cameras = copy.deepcopy(cameras)
 
-            # [修复] 状态同步
             for did, info in cameras.items():
                 if did in self._camera_img_managers:
                     mgr = self._camera_img_managers[did]
                     try:
                         if hasattr(mgr, "miot_camera_instance"):
                             status = await mgr.miot_camera_instance.get_status_async()
-                            # [修复] status=4 也算 connected
                             if status.value > 0:
                                 info.online = True
                                 info.camera_status = status
-                                # logger.info("[Refresh] Keeping %s ONLINE (Status: %s)", did, status)
                     except Exception:
                         pass
 
             self._camera_info_dict = cameras
             self._kv_dao.set(DeviceInfoKeys.CAMERA_INFO_KEY, json.dumps(to_jsonable_python(cameras)))
 
-            # 更新信息
             for did, manager in self._camera_img_managers.items():
-                if did in cameras:
-                    await manager.update_camera_info(cameras[did])
+                if did in cameras: await manager.update_camera_info(cameras[did])
 
-            # 清理
             dids_to_remove = []
             for did in list(self._camera_img_managers.keys()):
                 if did not in cameras:
                     await self._camera_img_managers[did].destroy()
                     dids_to_remove.append(did)
-                    if did in self._stream_subscribers:
-                        del self._stream_subscribers[did]
-            for k in dids_to_remove:
-                del self._camera_img_managers[k]
+                    if did in self._stream_subscribers: del self._stream_subscribers[did]
+            for k in dids_to_remove: del self._camera_img_managers[k]
 
-            # [修复] 保活逻辑：仅当不存在时创建，且不要覆盖高清流
+            # [关键恢复] 自动保活逻辑
+            # 对所有摄像头建立 Low Quality 连接，确保在线状态和缩略图功能
             for camera_did in cameras.keys():
                 if camera_did not in self._camera_img_managers:
-                    # 如果不存在，创建保活连接 (Q=1)
                     logger.info("[Refresh] Auto-connecting %s (Q=1) for Keep-Alive", camera_did)
                     await self._create_camera_img_manager(cameras[camera_did], target_quality=1)
                     if camera_did in self._camera_img_managers:
-                        # 注册主回调以保持视频队列畅通
+                        # 注册主回调以消耗视频数据
                         await self._camera_img_managers[camera_did].register_raw_stream(self._master_stream_callback, 0)
-                else:
-                    # 如果已存在，检查是否需要"维护"
-                    # 只要存在管理器，就认为它在运行，不要轻易用 Low Quality 覆盖它
-                    pass
 
             return cameras
         except Exception as e:
@@ -308,32 +300,40 @@ class MiotProxy:
         self._kv_dao.set(DeviceInfoKeys.SCENE_INFO_KEY, json.dumps(to_jsonable_python(scenes)))
         return scenes
 
+    async def get_all_scenes(self) -> dict[str, MIoTManualSceneInfo]:
+        if not self._scene_info_dict:
+            await self.refresh_scenes()
+        return self._scene_info_dict
+
     async def refresh_user_info(self):
         user_info = await self._miot_client.get_user_info_async()
         self._user_info = user_info
         self._kv_dao.set(DeviceInfoKeys.USER_INFO_KEY, json.dumps(to_jsonable_python(user_info)))
         return user_info
 
+    async def get_user_info(self) -> Optional[MIoTUserInfo]:
+        if not self._user_info:
+            await self.refresh_user_info()
+        return self._user_info
+
     async def _start_token_refresh_task(self):
         while True:
             try:
                 await asyncio.sleep(300)
                 await self._check_and_refresh_token()
-            except Exception:
+            except Exception as e:
+                logger.error(f"Token refresh task error: {e}")
                 await asyncio.sleep(60)
 
     async def _check_and_refresh_token(self):
         if self._oauth_info and self._oauth_info.expires_ts - int(time.time()) <= 1800:
             await self.refresh_xiaomi_home_token_info()
 
-    async def get_user_info(self):
-        return self._user_info
-
-    async def get_all_scenes(self):
-        return self._scene_info_dict
-
     async def execute_miot_scene(self, scene_id):
-        return await self._miot_client.run_manual_scene_async(self._scene_info_dict[scene_id])
+        if scene_id not in self._scene_info_dict: await self.refresh_scenes()
+        if scene_id in self._scene_info_dict:
+            return await self._miot_client.run_manual_scene_async(self._scene_info_dict[scene_id])
+        return False
 
     async def send_app_notify(self, nid):
         return await self._miot_client.send_app_notify_async(nid)
@@ -350,6 +350,7 @@ class MiotProxy:
     async def get_miot_auth_info(self, code, state):
         info = await self._miot_client.get_access_token_async(code, state)
         self.reset_miot_token_info(info)
+        asyncio.create_task(self.refresh_miot_info())
         return info
 
     def reset_miot_token_info(self, info):
@@ -363,6 +364,7 @@ class MiotProxy:
             oauth_info = await self._miot_client.refresh_access_token_async(self._oauth_info.refresh_token)
             self.reset_miot_token_info(oauth_info)
             await self._miot_client.update_access_token_async(oauth_info.access_token)
+            asyncio.create_task(self.refresh_miot_info())
             return oauth_info
         except Exception as e:
             logger.error("Failed to refresh token: %s", e)
