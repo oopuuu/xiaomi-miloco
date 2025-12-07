@@ -7,10 +7,12 @@ services:
     expose:
       - ${BACKEND_PORT:-8000}
       - ${RTSP_PORT:-8003}
+      - ${LITE_MODE:-true}
     environment:
       - BACKEND_HOST=${BACKEND_HOST:-0.0.0.0}
       - BACKEND_PORT=${BACKEND_PORT:-8000}
       - RTSP_PORT=${RTSP_PORT:-8003}
+      - LITE_MODE=${LITE_MODE:-true}
       - AI_ENGINE_HOST=${AI_ENGINE_HOST:-0.0.0.0}
       - AI_ENGINE_PORT=${AI_ENGINE_PORT:-8001}
       - BACKEND_LOG_LEVEL=${BACKEND_LOG_LEVEL:-info}

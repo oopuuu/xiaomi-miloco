@@ -25,15 +25,11 @@ TEMPLATES_DIR = PROJECT_ROOT / _config["directories"]["templates"]
 STATIC_DIR = PROJECT_ROOT / _config["directories"]["static"]
 
 # Storage directory with environment variable override support
-# Allows both relative and absolute paths
 def _get_storage_dir() -> Path:
-    """Get storage directory path with environment variable override support."""
     storage_config_path = _config["directories"]["storage"]
     if os.getenv("MILOCO_SERVER_STORAGE_DIR"):
-        # Use absolute path from environment variable
         return Path(os.getenv("MILOCO_SERVER_STORAGE_DIR"))
     else:
-        # Use relative path from config
         return PROJECT_ROOT / storage_config_path
 
 STORAGE_DIR = _get_storage_dir()
@@ -62,9 +58,18 @@ SERVER_CONFIG = {
     "ssl_keyfile": CERT_DIR / "key.pem",
 }
 
-# [新增] RTSP Configuration
-# 优先级：环境变量 (RTSP_PORT) > 配置文件 (rtsp.port) > 默认值 (8554)
-# 使用 .get() 方法防止配置文件中缺少 rtsp 字段导致报错
+# [修改] LITE_MODE 配置
+# 逻辑：优先读取环境变量 -> 其次读取 YAML 配置(server下) -> 默认 False
+# 这样你可以在 server_config.yaml 的 server 节点下加 lite_mode: true
+_env_lite = os.getenv("LITE_MODE")
+if _env_lite is not None:
+    LITE_MODE = _env_lite.lower() == "true"
+else:
+    # 尝试从 YAML 读取，位置 server: lite_mode
+    LITE_MODE = _config.get("server", {}).get("lite_mode", False)
+
+# [修改] RTSP Configuration
+# 优先读取环境变量 -> 其次读取 YAML (rtsp下) -> 默认 8554
 RTSP_PORT = str(
     os.getenv("RTSP_PORT") or
     _config.get("rtsp", {}).get("port", "8554")

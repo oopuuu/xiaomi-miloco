@@ -23,6 +23,7 @@ server:
   log_level: "info"
   enable_console_logging: true
   enable_file_logging: true
+  lite_mode: true
 
 # RTSP server configuration
 rtsp:

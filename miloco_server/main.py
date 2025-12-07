@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from miloco_server.utils.mediamtx import rtsp_server
+from miloco_server.config import LITE_MODE  # [新增]
 
 from miloco_server.config import APP_CONFIG, IMAGE_DIR, SERVER_CONFIG, STATIC_DIR
 from miloco_server.controller import (
@@ -54,14 +55,22 @@ async def catch_all_exceptions_middleware(request: Request, call_next):
 
 app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
 app.mount("/static/camera/images", AuthStaticFiles(directory=str(IMAGE_DIR)), name="images")
+
+# [关键修改] 核心路由 (所有模式必须加载)
 app.include_router(web_router)
 app.include_router(auth_router, prefix="/api")
 app.include_router(miot_router, prefix="/api")
 app.include_router(ha_router, prefix="/api")
-app.include_router(chat_router, prefix="/api")
-app.include_router(trigger_router, prefix="/api")
-app.include_router(model_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
+
+# [关键修改] 可选路由 (根据 Lite Mode 决定是否加载)
+if not LITE_MODE:
+    logger.info("Loading full feature routers (Chat, Trigger, Model)...")
+    app.include_router(chat_router, prefix="/api")
+    app.include_router(trigger_router, prefix="/api")
+    app.include_router(model_router, prefix="/api")
+else:
+    logger.info("Lite Mode active: Skipping Chat, Trigger, and Model routers.")
 
 
 @app.get("/{full_path:path}")
@@ -80,8 +89,11 @@ async def spa_handler(full_path: str):
 @app.on_event("startup")
 async def startup_event():
     """Application initialization operations on startup"""
-    logger.info("Initializing application...")
+    logger.info(f"Initializing application (Lite Mode: {LITE_MODE})...")
+
+    # 总是启动 RTSP Server
     rtsp_server.start()
+
     try:
         init_database()
         logger.info("Database initialization completed")
@@ -92,6 +104,7 @@ async def startup_event():
     logger.info("Application initialization completed")
 
     try:
+        # initialize 方法内部已经处理了 LITE_MODE 的逻辑，这里直接调用即可
         await get_manager().initialize(callback=open_browser_async)
         logger.info("Manager initialization completed")
     except Exception as e:
@@ -102,6 +115,12 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup operations when application shuts down"""
+    # [关键修改] 安全停止后台任务
+    manager = get_manager()
+    if not LITE_MODE and getattr(manager, "trigger_rule_runner", None):
+        logger.info("Stopping trigger rule runner...")
+        manager.trigger_rule_runner.stop()
+
     rtsp_server.stop()
     logger.info("Application is shutting down...")
     logger.info("Application has been shut down")
@@ -125,7 +144,7 @@ def open_browser_async():
 def start_server():
     """Start server and automatically open browser"""
     logger.debug("Debug log test - if you see this message, debug logging is enabled")
-    logger.info("Starting Miloco server...")
+    logger.info(f"Starting Miloco server (Lite Mode: {LITE_MODE})...")
 
     log_config = get_uvicorn_log_config()
     update_localhost_cert(cert_path=SERVER_CONFIG["ssl_certfile"], key_path=SERVER_CONFIG["ssl_keyfile"])
