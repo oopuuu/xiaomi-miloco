@@ -96,8 +96,8 @@ class FFmpegStreamer:
             '-use_wallclock_as_timestamps', '1',
             '-fflags', '+genpts+nobuffer',
             '-flags', 'low_delay',
-            '-analyzeduration', '1000000',
-            '-probesize', '1000000',
+            '-analyzeduration', '10000000',
+            '-probesize', '10000000',
 
             # Video Input
             '-f', video_codec, '-use_wallclock_as_timestamps', '1', '-i', self.pipe_video,
