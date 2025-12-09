@@ -182,14 +182,14 @@ class MiotService:
 
             # 2. [核心修复] 强制启动/重启 Streamer
             # 无论之前有没有，都先停止旧的，保证状态全新，管道干净
-            if camera_id in self._streamers:
+            # if camera_id in self._streamers:
                 # logger.info(f"Stopping stale streamer for {camera_id}")
                 self._streamers[camera_id].stop()
 
             # 创建新推流器
-            streamer = FFmpegStreamer(camera_id)
-            streamer.start(video_codec="hevc")
-            self._streamers[camera_id] = streamer
+            # streamer = FFmpegStreamer(camera_id)
+            # streamer.start(video_codec="hevc")
+            # self._streamers[camera_id] = streamer
 
             # [新增] 暴力清理：先注销该摄像头的所有回调，防止后台截图任务抢资源
             # 假设 C 库提供了 unregister 方法 (参考 test_miot_with_detect_async)
@@ -204,28 +204,28 @@ class MiotService:
             # 3. 定义数据回调
             # [关键] 必须传递 seq 参数，以便底层过滤器丢弃乱序包
             async def on_video_data(did, data, ts, seq, channel):
-                if did in self._streamers:
-                    self._streamers[did].push_video(data, seq)  # <--- 传入 seq
+                # if did in self._streamers:
+                #     self._streamers[did].push_video(data, seq)  # <--- 传入 seq
 
                 # 兼容旧 WebSocket
                 if callback:
                     await callback(did, data, ts, seq, channel, video_quality=video_quality, packet_type=1)
 
             async def on_audio_data(did, data, ts, seq, channel):
-                if did in self._streamers:
-                    self._streamers[did].push_audio(data, seq)  # <--- 传入 seq
+                # if did in self._streamers:
+                #     self._streamers[did].push_audio(data, seq)  # <--- 传入 seq
 
                 if callback:
                     await callback(did, data, ts, seq, channel, video_quality=video_quality, packet_type=2)
 
             # 4. 注册回调到 C 库
             await camera_instance.register_raw_video_async(callback=on_video_data, channel=channel, multi_reg=True)
-            # await camera_instance.register_raw_audio_async(callback=on_audio_data, channel=channel, multi_reg=True)
+            await camera_instance.register_raw_audio_async(callback=on_audio_data, channel=channel, multi_reg=True)
 
             # 5. 启动摄像头
             await camera_instance.start_async(qualities=video_quality, enable_audio=True, enable_reconnect=True)
 
-            logger.info(f"RTSP Streamer active: {streamer.rtsp_url}")
+            # logger.info(f"RTSP Streamer active: {streamer.rtsp_url}")
 
         except Exception as e:
             logger.error(f"Failed to start video stream: {e}", exc_info=True)
