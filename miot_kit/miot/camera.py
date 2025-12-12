@@ -486,7 +486,9 @@ class MIoTCameraInstance:
             v_callbacks = self._callbacks.get(f"raw_video.{channel}", {})
             for v_callback in list(v_callbacks.values()):
                 asyncio.run_coroutine_threadsafe(
-                    v_callback(self._did, frame_data.data, frame_data.timestamp, frame_data.sequence, channel),
+                    # [修改] 增加 frame_type 参数传给上层
+                    v_callback(self._did, frame_data.data, frame_data.timestamp, frame_data.sequence, channel,
+                               frame_data.frame_type),
                     self._main_loop
                 )
         elif codec_id in [MIoTCameraCodec.AUDIO_OPUS, MIoTCameraCodec.AUDIO_G711A, MIoTCameraCodec.AUDIO_G711U]:

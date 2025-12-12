@@ -158,11 +158,14 @@ class MiotProxy:
         else:
             logger.warning(f"Cannot create proxy for unknown camera: {did}")
 
-    async def _master_stream_callback(self, did: str, data: bytes, ts: int, seq: int, channel: int):
+    async def _master_stream_callback(self, did: str, data: bytes, ts: int, seq: int, channel: int, frame_type: int = None):
         if did in self._stream_subscribers:
             subscribers = list(self._stream_subscribers[did])
             for callback in subscribers:
                 try:
+                    # 注意：这里的下游 callback 可能也没更新签名
+                    # 如果下游 callback (比如 WS) 不需要 frame_type，我们就不传给它，或者由下游自己处理
+                    # 目前主要目的是防止这里 crash
                     await callback(did, data, ts, seq, channel)
                 except Exception as e:
                     logger.error("Error in subscriber callback for %s: %s", did, e)

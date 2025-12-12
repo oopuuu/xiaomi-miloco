@@ -337,8 +337,9 @@ class MIoTVideoStreamManager:
 
         # [关键修改] 构建带头部的包: Type(1 byte) + Payload
         # to_bytes(1, ...) 生成 b'\x01'，to_bytes(1, ...) 生成 b'\x02'
-        header = packet_type.to_bytes(1, 'big')
-        packet = header + data
+        # header = packet_type.to_bytes(1, 'big')
+        # packet = header + data
+        packet = data
 
         # 获取该相机组下的所有连接
         if camera_tag in self._camera_connect_map:
