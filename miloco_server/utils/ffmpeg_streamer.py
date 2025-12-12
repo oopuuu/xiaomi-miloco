@@ -11,10 +11,15 @@ logger = logging.getLogger(__name__)
 
 
 class PipeWriter(threading.Thread):
+    """
+    [漏桶策略] 独立线程写入管道，防止 FFmpeg 阻塞主线程
+    """
+
     def __init__(self, pipe_path, name):
         super().__init__(daemon=True)
         self.pipe_path = pipe_path
         self.name = name
+        # 300帧缓冲 (约10秒)，配合漏桶策略
         self.queue = queue.Queue(maxsize=300)
         self.fd = None
         self.running = True
@@ -37,21 +42,9 @@ class PipeWriter(threading.Thread):
     def write(self, data):
         if not self.running: return
 
-        # [监控] 检查队列深度
-        q_size = self.queue.qsize()
-
-        # 如果队列长期维持在高位 (>200)，说明下游(FFmpeg)处理太慢，延迟正在积累
-        if q_size > 200:
-            # logger.warning(f"[{self.name}] High Buffer Warning: {q_size}/300")
-            pass
-
+        # [漏桶逻辑] 队列满时，清空旧数据，只留最新的，强制追赶实时
         if self.queue.full():
             try:
-                # [关键行为监控] 打印这个日志！
-                # 如果这个日志每隔几秒就出现一次，说明你的网络带宽不足或编码太慢，
-                # 但同时也说明"漏桶机制"正在工作，强制把延迟“倒掉”了。
-                # 只要有这个机制，延迟就绝对不会无限累积。
-                logger.warning(f"[{self.name}] Buffer FULL! Dropping all old packets to fix latency.")
                 with self.queue.mutex:
                     self.queue.queue.clear()
             except:
@@ -94,12 +87,67 @@ class FFmpegStreamer:
     def __init__(self, camera_id: str, rtsp_target=None):
         self.camera_id = camera_id
         self.rtsp_url = rtsp_target or f"rtsp://127.0.0.1:{RTSP_PORT}/{camera_id}"
+
         self.pipe_video = f"/tmp/miloco_video_{camera_id}.pipe"
         self.pipe_audio = f"/tmp/miloco_audio_{camera_id}.pipe"
-        self.video_writer = None
-        self.audio_writer = None
-        self.process = None
+
+        self.video_writer: Optional[PipeWriter] = None
+        self.audio_writer: Optional[PipeWriter] = None
+        self.process: Optional[subprocess.Popen] = None
+
         self._last_video_seq = -1
+
+    def _get_video_output_args(self):
+        """
+        根据环境变量获取最佳的硬件加速参数
+        ENV: MILOCO_HW_ACCEL = cpu | intel | nvidia | mac | rpi
+        ENV: MILOCO_HW_DEVICE = /dev/dri/renderD128 (for intel/amd)
+        """
+        hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
+        hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
+
+        # 通用参数: 固定GOP为50(2秒), 禁用B帧(低延迟), 强制25fps
+        common_opts = ['-g', '50', '-bf', '0', '-r', '25', '-profile:v', 'main']
+
+        if hw_accel in ["intel", "amd", "vaapi"]:
+            logger.info(f"Using HW Accel: VAAPI ({hw_device})")
+            return [
+                '-vaapi_device', hw_device,
+                '-vf', 'format=nv12,hwupload',  # 必须将软解的帧上传到显存
+                '-c:v', 'h264_vaapi'
+            ] + common_opts
+
+        elif hw_accel in ["nvidia", "nvenc", "cuda"]:
+            logger.info("Using HW Accel: NVIDIA NVENC")
+            return [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',  # p1=fastest
+                '-tune', 'zerolatency',  # 零延迟调优
+                '-spatial-aq', '1'
+            ] + common_opts
+
+        elif hw_accel in ["mac", "apple", "videotoolbox"]:
+            logger.info("Using HW Accel: Apple VideoToolbox")
+            return [
+                '-c:v', 'h264_videotoolbox',
+                '-realtime', 'true',
+                '-allow_sw', '1'
+            ] + common_opts
+
+        elif hw_accel in ["rpi", "raspberry", "v4l2m2m"]:
+            logger.info("Using HW Accel: Raspberry Pi V4L2M2M")
+            return [
+                '-c:v', 'h264_v4l2m2m',
+                '-num_capture_buffers', '16'
+            ] + common_opts
+
+        else:  # "cpu" or unknown -> Fallback to libx264
+            logger.info("Using Software Encoding: libx264 (Ultrafast)")
+            return [
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',  # 极速预设，CPU占用极低
+                '-tune', 'zerolatency',  # 零延迟
+            ] + common_opts
 
     def start(self, video_codec="hevc"):
         self.stop()
@@ -110,14 +158,16 @@ class FFmpegStreamer:
         self.video_writer.start()
         self.audio_writer.start()
 
-        # [V9.2 最终版: 移除拦截 + 增强容错]
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-v', 'info', '-hide_banner',
+        # 动态获取视频编码参数
+        video_out_args = self._get_video_output_args()
 
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-v', 'error', '-hide_banner',
+
+            # --- Global ---
             '-use_wallclock_as_timestamps', '1',
             '-fflags', '+genpts+nobuffer+igndts',
             '-flags', 'low_delay',
-            # [新增] 忽略解码初期的错误，直到同步
             '-err_detect', 'ignore_err',
             '-analyzeduration', '5000000',
             '-probesize', '5000000',
@@ -125,29 +175,26 @@ class FFmpegStreamer:
             # --- Video Input (Raw) ---
             '-f', video_codec, '-use_wallclock_as_timestamps', '1', '-i', self.pipe_video,
 
-            # --- Audio Input (PCM s16le) ---
+            # --- Audio Input (PCM s16le from internal decoder) ---
+            # 必须匹配 decoder.py 输出的 16000Hz
             '-f', 's16le', '-ar', '16000', '-ac', '1', '-i', self.pipe_audio,
 
             '-map', '0:v', '-map', '1:a',
 
-            # --- Video Output: H.264 Re-encode ---
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-g', '50',
-            '-r', '25',
-            '-bf', '0',
-            '-profile:v', 'main',
+            # --- Video Output (Dynamic HW/SW) ---
+            *video_out_args,
 
-            # --- Audio Output: AAC ---
+            # --- Audio Output (AAC) ---
+            # aresample=async=1000: 消除累积延迟的神器
             '-af', 'aresample=async=1000',
             '-c:a', 'aac', '-ar', '16000', '-b:a', '32k',
 
+            # --- RTSP Output ---
             '-f', 'rtsp', '-rtsp_transport', 'tcp', '-max_muxing_queue_size', '400',
             self.rtsp_url,
         ]
 
-        logger.info(f"Starting FFmpeg (V9.2 Unfiltered) for {self.camera_id}...")
+        logger.info(f"Starting FFmpeg for {self.camera_id}...")
         self.process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
@@ -155,8 +202,7 @@ class FFmpegStreamer:
         if not self.process: return
         for line in self.process.stderr:
             l = line.decode(errors='ignore').strip()
-            # 过滤正常进度日志
-            if "frame=" not in l:
+            if "Error" in l or "rtsp" in l.lower():
                 logger.info(f"[FFmpeg {self.camera_id}] {l}")
 
     def stop(self):
@@ -171,13 +217,10 @@ class FFmpegStreamer:
                 self.process.kill()
             self.process = None
 
-    # [核心修正] 移除所有 frame_type 判断，只保留基本的 seq 过滤
-    # 这样可以确保 VPS/SPS/PPS 参数包顺利进入 FFmpeg
     def push_video(self, data: bytes, seq: int, is_i_frame: bool = False):
-        # 允许首帧，允许大跳变，拦截小范围乱序
+        # 简单乱序过滤
         if self._last_video_seq != -1 and seq <= self._last_video_seq:
             if self._last_video_seq - seq < 10000: return
-
         self._last_video_seq = seq
         self.video_writer.write(data)
 
