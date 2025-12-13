@@ -4,6 +4,7 @@ import subprocess
 import threading
 import queue
 import time
+import re
 from typing import Optional
 from miloco_server.config import RTSP_PORT
 
@@ -12,18 +13,23 @@ logger = logging.getLogger(__name__)
 
 class PipeWriter(threading.Thread):
     """
-    [漏桶策略] 独立线程写入管道，防止 FFmpeg 阻塞主线程
+    [漏桶策略 + 诊断监控] 独立线程写入管道，防止 FFmpeg 阻塞主线程
     """
 
     def __init__(self, pipe_path, name):
         super().__init__(daemon=True)
         self.pipe_path = pipe_path
         self.name = name
-        # 300帧缓冲 (约10秒)，配合漏桶策略
-        self.queue = queue.Queue(maxsize=300)
+        # 加大缓冲池到 500 (约15-20秒)，给硬件编码器更多缓冲时间
+        self.queue = queue.Queue(maxsize=500)
         self.fd = None
         self.running = True
         self._ensure_pipe()
+
+        # [诊断] 流量统计
+        self.total_bytes = 0
+        self.last_log_time = time.time()
+        self.drop_count = 0
 
     def _ensure_pipe(self):
         try:
@@ -42,8 +48,21 @@ class PipeWriter(threading.Thread):
     def write(self, data):
         if not self.running: return
 
-        # [漏桶逻辑] 队列满时，清空旧数据，只留最新的，强制追赶实时
+        # [诊断] 关键诊断点 1: 管道堵塞检测
+        # 如果队列长期维持在高位 (>400)，说明下游(FFmpeg)处理太慢
+        q_size = self.queue.qsize()
+        if q_size > 400:
+            if time.time() - self.last_log_time > 5:
+                logger.warning(f"[{self.name}] ⚠️ BUFFER WARNING: Queue size {q_size}/500. FFmpeg is too slow!")
+                self.last_log_time = time.time()
+
+        # [漏桶逻辑] 队列满时，清空旧数据，强制追赶实时
         if self.queue.full():
+            # [诊断] 丢包统计
+            self.drop_count += 1
+            if self.drop_count % 50 == 0:  # 每丢50个包报警一次
+                logger.error(f"[{self.name}] 🚨 BUFFER FULL: Dropping packets! Total dropped: {self.drop_count}")
+            
             try:
                 with self.queue.mutex:
                     self.queue.queue.clear()
@@ -52,6 +71,7 @@ class PipeWriter(threading.Thread):
 
         try:
             self.queue.put_nowait(data)
+            self.total_bytes += len(data)
         except:
             pass
 
@@ -61,10 +81,13 @@ class PipeWriter(threading.Thread):
                 data = self.queue.get(timeout=1.0)
                 if self.fd: os.write(self.fd, data)
             except queue.Empty:
+                # [诊断] 如果长期没数据，可能是上游断流
                 continue
-            except OSError:
+            except OSError as e:
+                logger.error(f"[{self.name}] OS Pipe Error: {e}")
                 break
-            except:
+            except Exception as e:
+                logger.error(f"[{self.name}] Unknown Error: {e}")
                 break
         self.close()
 
@@ -96,6 +119,10 @@ class FFmpegStreamer:
         self.process: Optional[subprocess.Popen] = None
 
         self._last_video_seq = -1
+        
+        # [诊断] 状态监控
+        self._last_health_check = time.time()
+        self._last_speed = 0.0
 
     def _get_video_output_args(self):
         """
@@ -113,7 +140,7 @@ class FFmpegStreamer:
             logger.info(f"Using HW Accel: VAAPI ({hw_device})")
             return [
                 '-vaapi_device', hw_device,
-                '-vf', 'format=nv12,hwupload',  # 必须将软解的帧上传到显存
+                '-vf', 'format=nv12,hwupload,scale_vaapi=format=nv12',  # 修正：VAAPI缩放链
                 '-c:v', 'h264_vaapi'
             ] + common_opts
 
@@ -162,7 +189,7 @@ class FFmpegStreamer:
         video_out_args = self._get_video_output_args()
 
         ffmpeg_cmd = [
-            'ffmpeg', '-y', '-v', 'error', '-hide_banner',
+            'ffmpeg', '-y', '-v', 'info', '-hide_banner', # 改回info级别以便捕获统计信息
 
             # --- Global ---
             '-use_wallclock_as_timestamps', '1',
@@ -194,16 +221,51 @@ class FFmpegStreamer:
             self.rtsp_url,
         ]
 
-        logger.info(f"Starting FFmpeg for {self.camera_id}...")
+        logger.info(f"Starting FFmpeg (Diagnostic Mode) for {self.camera_id}...")
         self.process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
     def _monitor_ffmpeg(self):
         if not self.process: return
+        
+        # [诊断] 正则表达式提取关键指标
+        # 典型输出: frame= 123 fps= 25 q=28.0 size= 1024kB time=00:00:10.5 bitrate=123.4kbits/s speed=1.01x
+        pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
+        
         for line in self.process.stderr:
             l = line.decode(errors='ignore').strip()
-            if "Error" in l or "rtsp" in l.lower():
-                logger.info(f"[FFmpeg {self.camera_id}] {l}")
+            
+            # 1. 捕捉错误
+            if "Error" in l or "fail" in l.lower() or "miss" in l.lower():
+                # 过滤掉一些不影响运行的常见警告，只报重要的
+                if "past duration" not in l and "non-monotonic" not in l:
+                     logger.warning(f"[FFmpeg Warning] {l}")
+
+            # 2. 捕捉性能指标 (每 30 秒打印一次，或性能异常时打印)
+            if "frame=" in l:
+                now = time.time()
+                match = pattern.search(l)
+                if match:
+                    frame_cnt = int(match.group(1))
+                    fps = float(match.group(2))
+                    speed = float(match.group(3))
+                    
+                    self._last_speed = speed
+                    
+                    # 异常检测：如果处理速度低于 0.9x，说明编码器跟不上了，必然卡顿
+                    if speed < 0.9:
+                        if now - self._last_health_check > 5:
+                            logger.warning(f"[FFmpeg Slow] 🐢 Speed: {speed}x (FPS: {fps}). GPU/CPU Overloaded!")
+                            self._last_health_check = now
+                    
+                    # 正常心跳：每30秒输出一次，证明还在活
+                    elif now - self._last_health_check > 30:
+                        logger.info(f"[FFmpeg Health] ✅ Speed: {speed}x | FPS: {fps} | Frames: {frame_cnt}")
+                        self._last_health_check = now
+            else:
+                # 启动时的关键信息
+                if "Opening" in l or "Output" in l or "Input" in l or "Stream #" in l:
+                    logger.info(f"[FFmpeg Info] {l}")
 
     def stop(self):
         if self.video_writer: self.video_writer.close()
