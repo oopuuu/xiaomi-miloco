@@ -17,7 +17,7 @@ class VideoJitterBuffer:
     视频抖动缓冲区：解决画面闪回/回退/花屏
     """
 
-    def __init__(self, max_latency_frames=25):
+    def __init__(self, max_latency_frames=15):  # 15帧 (约0.6秒)
         self.buffer: List[Tuple[int, bytes]] = []
         self.next_seq = -1
         self.max_latency = max_latency_frames
@@ -28,7 +28,6 @@ class VideoJitterBuffer:
         if self.next_seq == -1: self.next_seq = seq
 
         if abs(seq - self.next_seq) > self.force_reset_threshold:
-            # logger.warning(f"Seq jump {self.next_seq}->{seq}")
             self.buffer = []
             self.next_seq = seq
 
@@ -54,7 +53,7 @@ class VideoJitterBuffer:
 
 
 class PipeWriter(threading.Thread):
-    def __init__(self, pipe_path, name, max_size=300):
+    def __init__(self, pipe_path, name, max_size=100):
         super().__init__(daemon=True)
         self.pipe_path = pipe_path
         self.name = name
@@ -80,7 +79,6 @@ class PipeWriter(threading.Thread):
     def write(self, data):
         if not self.running: return
 
-        # 简单丢包策略：如果满了，清空旧的，保证实时性
         if self.queue.full():
             try:
                 with self.queue.mutex:
@@ -131,17 +129,14 @@ class FFmpegStreamer:
         self.audio_writer: Optional[PipeWriter] = None
         self.process: Optional[subprocess.Popen] = None
 
-        # 视频 Jitter Buffer
-        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=30)
-
-        # 诊断
+        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=15)
+        self._has_video_started = False
         self._last_health_check = time.time()
 
     def _get_video_output_args(self):
         hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
         hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
 
-        # 关键参数：FPS 模式设为 VFR (可变帧率)，适应 JitterBuffer 的输出抖动
         common_opts = ['-g', '50', '-bf', '0', '-fps_mode', 'vfr']
 
         if hw_accel in ["intel", "amd", "vaapi"]:
@@ -163,12 +158,11 @@ class FFmpegStreamer:
 
     def start(self, video_codec="hevc"):
         self.stop()
-        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=30)
+        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=15)
+        self._has_video_started = False
 
         self.video_writer = PipeWriter(self.pipe_video, "Video")
-
-        # 【修正 1】音频管道缓冲设置得非常小 (20)，防止音频在管道里积压导致滞后
-        self.audio_writer = PipeWriter(self.pipe_audio, "Audio", max_size=20)
+        self.audio_writer = PipeWriter(self.pipe_audio, "Audio", max_size=10)
 
         self.video_writer.start()
         self.audio_writer.start()
@@ -179,7 +173,6 @@ class FFmpegStreamer:
             'ffmpeg', '-y', '-v', 'info', '-hide_banner',
 
             # --- 全局参数 ---
-            # 【修正 2】彻底移除 wallclock，回归标准时间戳，解决无声问题
             '-fflags', '+genpts+nobuffer+igndts',
             '-flags', 'low_delay',
             '-analyzeduration', '1000000',
@@ -187,13 +180,11 @@ class FFmpegStreamer:
 
             # --- Video Input ---
             '-f', video_codec,
-            # 指定输入帧率，帮助 FFmpeg 均匀打标
             '-r', '25',
             '-i', self.pipe_video,
 
             # --- Audio Input ---
             '-f', 's16le', '-ar', '16000', '-ac', '1',
-            # 移除 wallclock，避免时间戳冲突
             '-i', self.pipe_audio,
 
             '-map', '0:v', '-map', '1:a',
@@ -202,9 +193,9 @@ class FFmpegStreamer:
             *video_out_args,
 
             # --- Audio Output ---
-            # 【修正 3】同步策略微调
-            # async=1: 允许音频重采样以匹配视频时钟
-            # first_pts=0: 强制从 0 开始
+            # 【修正】去掉了 max_comp，这会导致旧版 FFmpeg 报错
+            # async=1: 允许拉伸
+            # first_pts=0: 强制从 0 开始对齐
             '-af', 'aresample=async=1:first_pts=0',
             '-c:a', 'aac', '-ar', '16000', '-b:a', '32k',
 
@@ -213,7 +204,7 @@ class FFmpegStreamer:
             self.rtsp_url,
         ]
 
-        logger.info(f"Starting FFmpeg (Fix Audio) for {self.camera_id}...")
+        logger.info(f"Starting FFmpeg (Fix Params) for {self.camera_id}...")
         self.process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
@@ -246,7 +237,15 @@ class FFmpegStreamer:
         ordered_frames = self.jitter_buffer.push(data, seq)
         for frame_data in ordered_frames:
             self.video_writer.write(frame_data)
+            # 只有当视频真的写入了管道，才标记“视频已开始”
+            if not self._has_video_started:
+                logger.info(f"Video started at seq {seq}. Enabling audio pass-through.")
+                self._has_video_started = True
 
     def push_audio_raw(self, data: bytes):
+        # 视频没开始前，丢弃音频
+        if not self._has_video_started:
+            return
+
         if self.audio_writer:
             self.audio_writer.write(data)
