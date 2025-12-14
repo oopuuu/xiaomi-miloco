@@ -4,62 +4,20 @@ import subprocess
 import threading
 import queue
 import time
-import heapq
 import re
-from typing import Optional, List, Tuple
+import fcntl
+from typing import Optional
 from miloco_server.config import RTSP_PORT
 
 logger = logging.getLogger(__name__)
 
 
-class VideoJitterBuffer:
-    """
-    视频抖动缓冲区：解决画面闪回/回退/花屏
-    """
-
-    def __init__(self, max_latency_frames=15):  # 15帧 (约0.6秒)
-        self.buffer: List[Tuple[int, bytes]] = []
-        self.next_seq = -1
-        self.max_latency = max_latency_frames
-        self.force_reset_threshold = 1000
-
-    def push(self, data: bytes, seq: int) -> List[bytes]:
-        output_frames = []
-        if self.next_seq == -1: self.next_seq = seq
-
-        if abs(seq - self.next_seq) > self.force_reset_threshold:
-            self.buffer = []
-            self.next_seq = seq
-
-        if seq < self.next_seq: return []
-
-        heapq.heappush(self.buffer, (seq, data))
-
-        while self.buffer and self.buffer[0][0] == self.next_seq:
-            s, d = heapq.heappop(self.buffer)
-            output_frames.append(d)
-            self.next_seq += 1
-
-        if len(self.buffer) > self.max_latency:
-            new_seq, d = heapq.heappop(self.buffer)
-            output_frames.append(d)
-            self.next_seq = new_seq + 1
-            while self.buffer and self.buffer[0][0] == self.next_seq:
-                s, d = heapq.heappop(self.buffer)
-                output_frames.append(d)
-                self.next_seq += 1
-
-        return output_frames
-
-
-class PipeWriter(threading.Thread):
-    def __init__(self, pipe_path, name, max_size=100):
-        super().__init__(daemon=True)
+class PipeWriter:
+    def __init__(self, pipe_path, name, is_video=False):
         self.pipe_path = pipe_path
         self.name = name
-        self.queue = queue.Queue(maxsize=max_size)
+        self.is_video = is_video
         self.fd = None
-        self.running = True
         self._ensure_pipe()
 
     def _ensure_pipe(self):
@@ -67,45 +25,35 @@ class PipeWriter(threading.Thread):
             if os.path.exists(self.pipe_path):
                 try:
                     os.remove(self.pipe_path)
-                except:
+                except OSError:
                     pass
             os.mkfifo(self.pipe_path)
-            self.fd = os.open(self.pipe_path, os.O_RDWR)
-            logger.info(f"[{self.name}] Pipe opened: {self.pipe_path}")
-        except Exception as e:
-            logger.error(f"[{self.name}] Pipe error: {e}")
-            self.running = False
 
-    def write(self, data):
-        if not self.running: return
+            # 阻塞模式，保证数据不丢
+            flags = os.O_RDWR
+            self.fd = os.open(self.pipe_path, flags)
 
-        if self.queue.full():
             try:
-                with self.queue.mutex:
-                    self.queue.queue.clear()
-            except:
+                F_SETPIPE_SZ = 1031
+                # 视频给足 1MB，音频 64KB
+                fcntl.fcntl(self.fd, F_SETPIPE_SZ, 1024 * 1024 if self.is_video else 65536)
+            except Exception:
                 pass
 
-        try:
-            self.queue.put_nowait(data)
-        except:
-            pass
+            logger.info(f"[{self.name}] Pipe opened: {self.pipe_path}")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.name}] Pipe creation error: {e}")
+            return False
 
-    def run(self):
-        while self.running:
-            try:
-                data = self.queue.get(timeout=1.0)
-                if self.fd: os.write(self.fd, data)
-            except queue.Empty:
-                continue
-            except OSError:
-                break
-            except:
-                break
-        self.close()
+    def write_direct(self, data: bytes):
+        if self.fd is None: return
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            self.close()
 
     def close(self):
-        self.running = False
         if self.fd:
             try:
                 os.close(self.fd)
@@ -125,106 +73,95 @@ class FFmpegStreamer:
         self.rtsp_url = rtsp_target or f"rtsp://127.0.0.1:{RTSP_PORT}/{camera_id}"
         self.pipe_video = f"/tmp/miloco_video_{camera_id}.pipe"
         self.pipe_audio = f"/tmp/miloco_audio_{camera_id}.pipe"
+
         self.video_writer: Optional[PipeWriter] = None
         self.audio_writer: Optional[PipeWriter] = None
         self.process: Optional[subprocess.Popen] = None
 
-        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=15)
-        self._has_video_started = False
         self._last_health_check = time.time()
 
     def _get_video_output_args(self):
-        hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
-        hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
-
-        common_opts = ['-g', '50', '-bf', '0', '-fps_mode', 'vfr']
-
-        if hw_accel in ["intel", "amd", "vaapi"]:
-            logger.info(f"Using HW Accel: VAAPI ({hw_device})")
-            return ['-vaapi_device', hw_device, '-vf', 'format=nv12,hwupload,scale_vaapi=format=nv12', '-c:v',
-                    'h264_vaapi'] + common_opts
-        elif hw_accel in ["nvidia", "nvenc", "cuda"]:
-            logger.info("Using HW Accel: NVIDIA NVENC")
-            return ['-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'zerolatency'] + common_opts
-        elif hw_accel in ["mac", "apple", "videotoolbox"]:
-            logger.info("Using HW Accel: Apple VideoToolbox")
-            return ['-c:v', 'h264_videotoolbox', '-realtime', 'true'] + common_opts
-        elif hw_accel in ["rpi", "raspberry"]:
-            logger.info("Using HW Accel: RPi")
-            return ['-c:v', 'h264_v4l2m2m'] + common_opts
-        else:
-            logger.info("Using SW Encoding: libx264")
-            return ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency'] + common_opts
+        return [
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-g', '50', '-bf', '0', '-profile:v', 'baseline'
+        ]
 
     def start(self, video_codec="hevc"):
         self.stop()
-        self.jitter_buffer = VideoJitterBuffer(max_latency_frames=15)
-        self._has_video_started = False
 
-        self.video_writer = PipeWriter(self.pipe_video, "Video")
-        self.audio_writer = PipeWriter(self.pipe_audio, "Audio", max_size=10)
+        try:
+            self.video_writer = PipeWriter(self.pipe_video, "Video", is_video=True)
+            self.audio_writer = PipeWriter(self.pipe_audio, "Audio", is_video=False)
 
-        self.video_writer.start()
-        self.audio_writer.start()
+            video_out_args = self._get_video_output_args()
 
-        video_out_args = self._get_video_output_args()
+            ffmpeg_cmd = [
+                'ffmpeg', '-y', '-v', 'info', '-hide_banner',
+                '-fflags', '+genpts+nobuffer+igndts',
+                '-flags', 'low_delay',
 
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-v', 'info', '-hide_banner',
+                # [核心修正 1] 移除 -r 25！
+                # [核心修正 2] 启用 wallclock，让 FFmpeg 使用 Python 写入时的系统时间作为 PTS
 
-            # --- 全局参数 ---
-            '-fflags', '+genpts+nobuffer+igndts',
-            '-flags', 'low_delay',
-            '-analyzeduration', '1000000',
-            '-probesize', '1000000',
+                # --- Video Input ---
+                '-thread_queue_size', '32',
+                '-f', video_codec,
+                # '-r', '25',  <-- 罪魁祸首已删除！
+                '-use_wallclock_as_timestamps', '1',
+                '-i', self.pipe_video,
 
-            # --- Video Input ---
-            '-f', video_codec,
-            '-r', '25',
-            '-i', self.pipe_video,
+                # --- Audio Input ---
+                '-thread_queue_size', '32',
+                '-f', 's16le', '-ar', '16000', '-ac', '1',
+                '-use_wallclock_as_timestamps', '1',
+                '-i', self.pipe_audio,
 
-            # --- Audio Input ---
-            '-f', 's16le', '-ar', '16000', '-ac', '1',
-            '-i', self.pipe_audio,
+                '-map', '0:v', '-map', '1:a',
 
-            '-map', '0:v', '-map', '1:a',
+                # --- 过滤器 ---
+                # 1. 视频和音频都重置 PTS，使它们从 0 开始
+                # 2. aresample=async=1: 这是一个神器。
+                #    因为它发现视频是 19.6fps 而不是标准的 25fps，音频时间轴会和视频微小错位。
+                #    这个参数会拉伸/压缩音频来强行匹配视频的时间轴。
+                '-vf', 'setpts=PTS-STARTPTS',
+                '-af', 'aresample=async=1:first_pts=0',
 
-            # --- Video Output ---
-            *video_out_args,
+                # Output
+                *video_out_args,
+                '-c:a', 'aac', '-ar', '16000', '-b:a', '32k',
 
-            # --- Audio Output ---
-            # 【修正】去掉了 max_comp，这会导致旧版 FFmpeg 报错
-            # async=1: 允许拉伸
-            # first_pts=0: 强制从 0 开始对齐
-            '-af', 'aresample=async=1:first_pts=0',
-            '-c:a', 'aac', '-ar', '16000', '-b:a', '32k',
+                '-f', 'rtsp', '-rtsp_transport', 'tcp', '-max_muxing_queue_size', '400',
+                self.rtsp_url,
+            ]
 
-            # --- RTSP Output ---
-            '-f', 'rtsp', '-rtsp_transport', 'tcp', '-max_muxing_queue_size', '400',
-            self.rtsp_url,
-        ]
+            logger.info(f"Starting FFmpeg (FPS Correction Mode) for {self.camera_id}...")
+            self.process = subprocess.Popen(
+                ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+            threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
-        logger.info(f"Starting FFmpeg (Fix Params) for {self.camera_id}...")
-        self.process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+        except Exception as e:
+            logger.error(f"Start failed: {e}")
+            self.stop()
 
     def _monitor_ffmpeg(self):
         if not self.process: return
         pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
-        for line in self.process.stderr:
-            l = line.decode(errors='ignore').strip()
-            if "frame=" in l:
-                now = time.time()
-                match = pattern.search(l)
-                if match and (now - self._last_health_check > 30):
-                    logger.info(f"[FFmpeg Status] {l}")
-                    self._last_health_check = now
-            elif "Error" in l or "fail" in l.lower():
-                if "past duration" not in l: logger.warning(f"[FFmpeg Warning] {l}")
+        try:
+            for line in self.process.stderr:
+                l = line.decode(errors='ignore').strip()
+                if "frame=" in l:
+                    now = time.time()
+                    match = pattern.search(l)
+                    if match and (now - self._last_health_check > 30):
+                        logger.info(f"[FFmpeg Status] {l}")
+                        self._last_health_check = now
+        except Exception:
+            pass
 
     def stop(self):
-        if self.video_writer: self.video_writer.close()
-        if self.audio_writer: self.audio_writer.close()
+        if self.video_writer: self.video_writer.close(); self.video_writer = None
+        if self.audio_writer: self.audio_writer.close(); self.audio_writer = None
         if self.process:
             self.process.terminate()
             try:
@@ -233,19 +170,9 @@ class FFmpegStreamer:
                 self.process.kill()
             self.process = None
 
-    def push_video(self, data: bytes, seq: int, is_i_frame: bool = False):
-        ordered_frames = self.jitter_buffer.push(data, seq)
-        for frame_data in ordered_frames:
-            self.video_writer.write(frame_data)
-            # 只有当视频真的写入了管道，才标记“视频已开始”
-            if not self._has_video_started:
-                logger.info(f"Video started at seq {seq}. Enabling audio pass-through.")
-                self._has_video_started = True
-
     def push_audio_raw(self, data: bytes):
-        # 视频没开始前，丢弃音频
-        if not self._has_video_started:
-            return
+        if self.audio_writer: self.audio_writer.write_direct(data)
 
-        if self.audio_writer:
-            self.audio_writer.write(data)
+    def push_video(self, data: bytes, seq: int, is_i_frame: bool = False):
+        if self.video_writer:
+            self.video_writer.write_direct(data)
