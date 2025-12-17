@@ -362,12 +362,17 @@ class MiotProxy:
         if self._miot_client.http_client: self._miot_client.http_client.access_token = info.access_token
 
     async def refresh_xiaomi_home_token_info(self) -> MIoTOauthInfo:
-        try:
-            if not self._oauth_info: raise ValueError("No oauth_info")
-            oauth_info = await self._miot_client.refresh_access_token_async(self._oauth_info.refresh_token)
-            self.reset_miot_token_info(oauth_info)
-            await self._miot_client.update_access_token_async(oauth_info.access_token)
-            asyncio.create_task(self.refresh_miot_info())
-            return oauth_info
-        except Exception as e:
-            logger.error("Failed to refresh token: %s", e)
+            try:
+                if not self._oauth_info:
+                    raise ValueError("No oauth_info found")
+                oauth_info = await self._miot_client.refresh_access_token_async(
+                    refresh_token=self._oauth_info.refresh_token
+                )
+                logger.info("Successfully refreshed Xiaomi home token info: %s", oauth_info)
+                self.reset_miot_token_info(oauth_info)
+                await asyncio.sleep(3)
+                await self.refresh_miot_info()
+                return oauth_info
+            except Exception as e: # pylint: disable=broad-exception-caught
+                self._oauth_info = None
+                logger.error("Failed to refresh Xiaomi home token info: %s", e, exc_info=True)
