@@ -5,6 +5,7 @@ import threading
 import time
 import re
 import fcntl
+import gc  # [新增] 引入垃圾回收模块
 from typing import Optional
 from miloco_server.config import RTSP_PORT
 
@@ -15,7 +16,6 @@ class PipeWriter:
     """
     [PipeWriter] 阻塞式 I/O
     """
-
     def __init__(self, pipe_path, name, is_video=False):
         self.pipe_path = pipe_path
         self.name = name
@@ -40,7 +40,7 @@ class PipeWriter:
                 fcntl.fcntl(self.fd, F_SETPIPE_SZ, size)
             except Exception:
                 pass
-            # 简化日志: 只有 debug 模式才打印管道打开信息
+            # 简化日志: 只有 debug 模式才打印
             logger.debug(f"[{self.name}] Pipe opened: {self.pipe_path}")
             return True
         except Exception as e:
@@ -80,7 +80,7 @@ class FFmpegStreamer:
         self._last_health_check = time.time()
 
     def start(self, video_codec="hevc"):
-        self.stop()
+        self.stop()  # 启动前彻底清理旧进程
 
         hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
         hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
@@ -90,22 +90,26 @@ class FFmpegStreamer:
         video_out_args = []
         common_opts = ['-g', '50', '-bf', '0']
 
-        # --- 混合架构 (Hybrid) ---
+        # --- 混合架构 (Stable Hybrid) ---
+        # 移除了不稳定的 scale_vaapi，解决 -38 报错和内存泄露
         if hw_accel in ["intel", "amd", "vaapi"]:
-            # 简化日志
             logger.info(f"FFmpeg Mode: Hybrid VAAPI ({self.camera_id})")
 
             global_args = [
                 '-init_hw_device', f'vaapi=va:{hw_device}',
                 '-filter_hw_device', 'va'
             ]
+            
+            # 仅做格式转换和上传，不做缩放，这是最稳的
             video_filters.extend(['format=nv12', 'hwupload'])
+            
             video_out_args = [
-                                 '-c:v', 'h264_vaapi',
-                                 '-async_depth', '1',
-                                 '-rc_mode', 'CQP',
-                                 '-global_quality', '25'
-                             ] + common_opts
+                '-c:v', 'h264_vaapi',
+                '-async_depth', '1',
+                '-rc_mode', 'CQP',
+                '-global_quality', '25',
+                '-profile:v', 'main'
+            ] + common_opts
 
         elif hw_accel in ["nvidia", "nvenc", "cuda"]:
             logger.info(f"FFmpeg Mode: NVIDIA ({self.camera_id})")
@@ -118,7 +122,7 @@ class FFmpegStreamer:
 
         video_filter_str = ",".join(video_filters)
 
-        # 音频：防拖尾配置
+        # 音频：保持防拖尾
         audio_filter_chain = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
 
         try:
@@ -128,8 +132,8 @@ class FFmpegStreamer:
             ffmpeg_cmd = [
                 'ffmpeg', '-y',
                 '-hide_banner',
-                '-loglevel', 'warning',  # [净化] 只显示警告和错误，屏蔽 info
-                '-stats',  # [保留] 强制显示进度条(frame=...)供Python解析
+                '-loglevel', 'warning', 
+                '-stats',
 
                 '-fflags', '+genpts+nobuffer+igndts',
                 '-flags', 'low_delay',
@@ -158,6 +162,10 @@ class FFmpegStreamer:
 
                 *video_out_args,
                 '-c:a', 'aac', '-ar', '16000', '-b:a', '64k',
+                
+                # [关键修复] 补回 HomeKit 4G 观看补丁
+                '-pkt_size', '1316',
+
                 '-f', 'rtsp', '-rtsp_transport', 'tcp', '-max_muxing_queue_size', '400',
                 self.rtsp_url,
             ])
@@ -173,10 +181,10 @@ class FFmpegStreamer:
         if not self.process: return
         pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
 
-        # 定义需要屏蔽的关键词（这些通常是启动时的非致命警告）
         ignore_keywords = [
             'pps', 'nalu', 'header', 'buffer', 'frame rate', 'unspecified',
-            'params', 'ref with poc', 'too many bits', 'last message repeated'
+            'params', 'ref with poc', 'too many bits', 'last message repeated',
+            'deprecated', 'pixel format', 'function not implemented'
         ]
 
         while self.process and self.process.poll() is None:
@@ -187,18 +195,14 @@ class FFmpegStreamer:
                 if not l: continue
 
                 if "frame=" in l:
-                    # 只有每 30 秒才打印一次状态
                     now = time.time()
-                    if (now - self._last_health_check > 30):
+                    if (now - self._last_health_check > 60):  # 降低心跳日志频率
                         match = pattern.search(l)
                         if match:
-                            logger.info(f"[RTSP] Running... {match.group(0)}")
+                            logger.info(f"[RTSP] Active... {match.group(0)}")
                             self._last_health_check = now
                 else:
-                    # [深度净化逻辑]
-                    # 1. 必须包含 fatal/error/failed 等严重词汇
                     is_fatal = any(x in l.lower() for x in ['failed', 'unable', 'no such', 'fatal', 'error'])
-                    # 2. 且不能包含屏蔽词 (防止把 "Error parsing NALU" 这种启动噪音打出来)
                     is_ignored = any(k in l.lower() for k in ignore_keywords)
 
                     if is_fatal and not is_ignored:
@@ -213,15 +217,25 @@ class FFmpegStreamer:
                 logger.error(f"FFmpeg exited unexpectedly code: {ret}")
 
     def stop(self):
+        # 1. 优先关闭管道
         if self.video_writer: self.video_writer.close(); self.video_writer = None
         if self.audio_writer: self.audio_writer.close(); self.audio_writer = None
+        
+        # 2. 强力终止进程
         if self.process:
-            self.process.terminate()
             try:
-                self.process.wait(timeout=2)
+                self.process.terminate()
+                self.process.wait(timeout=3)
             except:
-                self.process.kill()
+                try:
+                    self.process.kill()  # 强制 Kill
+                    self.process.wait()
+                except:
+                    pass
             self.process = None
+            
+        # 3. [关键修复] 显式垃圾回收，防止内存堆积
+        gc.collect()
 
     def push_audio_raw(self, data: bytes):
         if self.audio_writer: self.audio_writer.write_direct(data)
