@@ -7,12 +7,14 @@ import re
 import fcntl
 import gc
 import psutil
+import select
 from typing import Optional
 from miloco_server.config import RTSP_PORT
 
 logger = logging.getLogger(__name__)
 
 def get_memory_usage():
+    """获取当前进程内存占用，用于监控泄漏"""
     try:
         process = psutil.Process(os.getpid())
         mem = process.memory_info().rss / 1024 / 1024
@@ -22,71 +24,52 @@ def get_memory_usage():
 
 class PipeWriter:
     """
-    [PipeWriter]
+    [PipeWriter] 稳定版：非阻塞 I/O + 异常状态记录
     """
     def __init__(self, pipe_path, name, is_video=False):
         self.pipe_path = pipe_path
         self.name = name
         self.is_video = is_video
         self.fd = None
-        self._broken = False
+        self._broken = False # 状态标记，防止日志刷屏
         self._ensure_pipe()
 
     def _ensure_pipe(self):
-        self._cleanup_file()
+        self.close() 
         try:
+            if os.path.exists(self.pipe_path):
+                os.remove(self.pipe_path)
             os.mkfifo(self.pipe_path)
-            time.sleep(0.05)
+            
+            # 使用非阻塞模式打开，这是防止 Python 线程卡死(导致内存不释放)的关键
             self.fd = os.open(self.pipe_path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 F_SETPIPE_SZ = 1031
-                size = 1048576 if self.is_video else 262144
+                size = 1048576 if self.is_video else 131072
                 fcntl.fcntl(self.fd, F_SETPIPE_SZ, size)
             except Exception:
                 pass
-            logger.debug(f"[{self.name}] Pipe ready: {self.pipe_path}")
+            logger.debug(f"[{self.name}] Pipe opened: {self.pipe_path}")
             self._broken = False
+            return True
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to create pipe: {e}")
+            logger.error(f"[{self.name}] Pipe creation error: {e}")
             self._broken = True
-
-    def _cleanup_file(self):
-        if os.path.exists(self.pipe_path):
-            try:
-                os.remove(self.pipe_path)
-            except OSError:
-                pass
+            return False
 
     def write_direct(self, data: bytes):
-        if self.fd is None or self._broken: 
-            return
-        
-        # 音频重试10次，视频不重试
-        retries = 0 if self.is_video else 10
-        
-        for i in range(retries + 1):
-            try:
-                os.write(self.fd, data)
-                return 
-            except BlockingIOError:
-                if self.is_video:
-                    return 
-                if i < retries:
-                    time.sleep(0.002)
-                    continue
-                return 
-            except (BrokenPipeError, OSError) as e:
-                if isinstance(e, OSError) and e.errno == 11:
-                    if not self.is_video and i < retries:
-                        time.sleep(0.002)
-                        continue
-                    return
-
-                if not self._broken:
-                    logger.warning(f"[{self.name}] Pipe Broken! (FFmpeg died?), stopping write.")
-                    self._broken = True
-                    self.close()
-                return
+        if self.fd is None: return
+        try:
+            os.write(self.fd, data)
+        except BlockingIOError:
+            # 管道满了，丢弃数据。这是正常的背压保护，不打印日志以免刷屏
+            pass 
+        except (BrokenPipeError, OSError) as e:
+            # [关键诊断日志] 管道破裂意味着 FFmpeg 进程可能已经挂了
+            if not self._broken:
+                logger.warning(f"[{self.name}] Pipe broken/disconnected: {e}")
+                self._broken = True
+            self.close()
 
     def close(self):
         if self.fd:
@@ -95,17 +78,19 @@ class PipeWriter:
             except:
                 pass
             self.fd = None
-        self._cleanup_file()
+        if os.path.exists(self.pipe_path):
+            try:
+                os.remove(self.pipe_path)
+            except:
+                pass
 
     def __del__(self):
         self.close()
 
 
 class FFmpegStreamer:
-    # 冷却策略
-    _global_cooldown_until = 0
-    _global_cooldown_step = 10 
-    _global_start_lock = threading.Lock()
+    # 全局锁，防止多次点击导致并发冲突
+    _start_lock = threading.Lock()
 
     def __init__(self, camera_id: str, rtsp_target=None):
         self.camera_id = camera_id
@@ -115,36 +100,18 @@ class FFmpegStreamer:
         self.video_writer: Optional[PipeWriter] = None
         self.audio_writer: Optional[PipeWriter] = None
         self.process: Optional[subprocess.Popen] = None
-        
-        self._last_health_check = 0 
-        
-        # [智能看门狗变量]
-        self._last_frame_total = 0
-        self._last_dup_total = 0
-        self._frozen_counter = 0 # 连续完全冻结计数
-        
-        self._stop_lock = threading.Lock()
-        self._should_restart = False
+        self._last_health_check = 0
+        self._stop_event = threading.Event()
 
     def start(self, video_codec="hevc"):
-        now = time.time()
-        if now < FFmpegStreamer._global_cooldown_until:
-            wait_time = int(FFmpegStreamer._global_cooldown_until - now)
-            # 只有剩余时间较长才打印，避免日志刷屏
-            if wait_time > 2:
-                logger.warning(f"Start REJECTED: Cooling down for {wait_time}s...")
-            return
-
-        if not FFmpegStreamer._global_start_lock.acquire(blocking=False):
+        if not self._start_lock.acquire(blocking=False):
+            logger.warning(f"Start request ignored: Another start sequence is in progress.")
             return
 
         try:
-            self.stop() 
+            self.stop() # 启动前先彻底清理
+            self._stop_event.clear()
             self._last_health_check = time.time()
-            self._frozen_counter = 0
-            self._last_frame_total = 0
-            self._last_dup_total = 0
-            self._should_restart = False
 
             hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
             hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
@@ -155,7 +122,7 @@ class FFmpegStreamer:
             common_opts = ['-g', '50', '-bf', '0']
 
             if hw_accel in ["intel", "amd", "vaapi"]:
-                logger.info(f"FFmpeg Start: Hybrid CPU-Decode/GPU-Encode ({self.camera_id})")
+                logger.info(f"FFmpeg Mode: Hybrid VAAPI ({self.camera_id})")
                 global_args = [
                     '-init_hw_device', f'vaapi=va:{hw_device}',
                     '-filter_hw_device', 'va'
@@ -170,14 +137,16 @@ class FFmpegStreamer:
                 ] + common_opts
 
             elif hw_accel in ["nvidia", "nvenc", "cuda"]:
-                logger.info(f"FFmpeg Start: NVIDIA ({self.camera_id})")
+                logger.info(f"FFmpeg Mode: NVIDIA ({self.camera_id})")
                 video_out_args = ['-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'zerolatency'] + common_opts
 
             else:
-                logger.info(f"FFmpeg Start: CPU ({self.camera_id})")
+                logger.info(f"FFmpeg Mode: CPU ({self.camera_id})")
                 video_out_args = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'baseline'] + common_opts
 
             video_filter_str = ",".join(video_filters)
+            
+            # [低延迟音频配置] async=1 + min_hard_comp 允许动态对齐，解决断音和延迟
             audio_filter_chain = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
 
             try:
@@ -188,29 +157,27 @@ class FFmpegStreamer:
                     'ffmpeg', '-y',
                     '-hide_banner',
                     '-loglevel', 'warning', 
-                    '-nostats',            
-                    '-progress', 'pipe:2', 
+                    '-stats',  # 必须开启，否则无法监控进度
+
                     '-fflags', '+genpts+nobuffer+igndts',
                     '-flags', 'low_delay',
-                    
-                    # [恢复] 修复H.265码流头，增强兼容性
-                    '-bsf:v', 'hevc_mp4toannexb', 
-                    
-                    '-ec', 'guess_mvs+deblock', 
+
+                    '-analyzeduration', '1000000',
+                    '-probesize', '1000000',
                     '-err_detect', 'ignore_err',
-                    '-analyzeduration', '2000000', 
-                    '-probesize', '2000000',
                 ]
 
                 ffmpeg_cmd.extend(global_args)
+
                 ffmpeg_cmd.extend([
                     '-thread_queue_size', '128',
                     '-f', video_codec,
-                    '-use_wallclock_as_timestamps', '1', 
+                    '-use_wallclock_as_timestamps', '1', # 视频使用绝对时钟，保证画面低延迟
                     '-i', self.pipe_video,
 
                     '-thread_queue_size', '512',
                     '-f', 's16le', '-ar', '16000', '-ac', '1',
+                    '-use_wallclock_as_timestamps', '1', # 音频也使用绝对时钟，通过 aresample 解决断续
                     '-i', self.pipe_audio,
 
                     '-map', '0:v', '-map', '1:a',
@@ -219,8 +186,7 @@ class FFmpegStreamer:
 
                     *video_out_args,
                     '-c:a', 'aac', '-ar', '16000', '-b:a', '64k',
-                    '-max_interleave_delta', '0', 
-                    '-pkt_size', '1316', 
+                    '-max_interleave_delta', '0',
                     '-f', 'rtsp', '-rtsp_transport', 'tcp', '-max_muxing_queue_size', '400',
                     self.rtsp_url,
                 ])
@@ -229,128 +195,84 @@ class FFmpegStreamer:
                     ffmpeg_cmd, 
                     stdout=subprocess.DEVNULL, 
                     stderr=subprocess.PIPE,
-                    text=True,     
-                    bufsize=1      
+                    text=True,  
+                    bufsize=1   
                 )
                 threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
 
             except Exception as e:
-                logger.error(f"FFmpeg Launch Failed: {e}")
+                logger.error(f"FFmpeg start failed: {e}")
                 self.stop()
         finally:
-            FFmpegStreamer._global_start_lock.release()
-            
-    def _trigger_global_restart(self, reason: str):
-        logger.error(f"[Watchdog] {reason}. Cooling down for {FFmpegStreamer._global_cooldown_step}s...")
-        self._should_restart = True
-        FFmpegStreamer._global_cooldown_until = time.time() + FFmpegStreamer._global_cooldown_step
-        FFmpegStreamer._global_cooldown_step = min(FFmpegStreamer._global_cooldown_step + 10, 60)
-        if self.process:
-            self.process.kill()
+            self._start_lock.release()
 
     def _monitor_ffmpeg(self):
         if not self.process: return
         
-        progress_data = {}
-        allow_prefixes = ['Input #', 'Output #', 'Stream #', 'Stream mapping:']
-        # 仅针对极少数无法恢复的硬件错误重启
-        fatal_hw_errors = [
-            'operation not permitted', 'invalid argument',
-            'error submitting packet to decoder', 'hardware accelerator failed'
-        ]
+        # 使用 select 监听 stderr，这是防止僵死和内存泄露的最稳健方法
+        fd = self.process.stderr.fileno()
+        os.set_blocking(fd, False)
         
-        start_time = time.time()
+        pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
+        # 忽略常规的启动警告
+        ignore_keywords = ['pps', 'nalu', 'header', 'buffer', 'frame rate', 'unspecified', 'params', 'last message repeated', 'deprecated']
 
-        for line in self.process.stderr:
-            line = line.strip()
-            if not line: continue
+        while not self._stop_event.is_set():
+            if self.process.poll() is not None:
+                logger.error(f"FFmpeg process exited unexpectedly (Code: {self.process.returncode})")
+                break
 
-            if any(err in line.lower() for err in fatal_hw_errors):
-                self._trigger_global_restart(f"Fatal Error: '{line}'")
-                break 
-
-            if '=' in line and ' ' not in line.split('=', 1)[0]:
-                try:
-                    k, v = line.split('=', 1)
-                    progress_data[k.strip()] = v.strip()
+            try:
+                # 1秒超时，不阻塞线程
+                ready = select.select([fd], [], [], 1.0)
+                if ready[0]:
+                    line = self.process.stderr.readline()
+                    if not line: continue
                     
-                    if k == 'progress' and v == 'continue':
+                    l = line.strip()
+                    if not l: continue
+
+                    if "frame=" in l:
                         now = time.time()
-                        
-                        if (now - start_time > 60) and FFmpegStreamer._global_cooldown_step > 10:
-                            logger.info("[Watchdog] Stable. Resetting cooldown.")
-                            FFmpegStreamer._global_cooldown_step = 10
-                        
-                        # [智能防误杀逻辑]
-                        curr_frame = int(progress_data.get('frame', 0))
-                        curr_dup = int(progress_data.get('dup_frames', progress_data.get('dup', 0)))
-                        
-                        delta_frame = curr_frame - self._last_frame_total
-                        delta_dup = curr_dup - self._last_dup_total
-                        
-                        self._last_frame_total = curr_frame
-                        self._last_dup_total = curr_dup
-                        
-                        # 判断：只有当产生的帧 95% 以上都是重复帧时，才计数为“冻结”
-                        # 正常情况：25fps输出，15fps输入 -> 每秒约10个重复帧，占比 40%，不会触发
-                        # 卡死情况：25fps输出，0fps输入  -> 每秒25个重复帧，占比 100%，会触发
-                        if delta_frame > 0 and (delta_dup / delta_frame) > 0.95:
-                            self._frozen_counter += 1
-                        else:
-                            self._frozen_counter = 0 # 只要有一点新数据，就清零计数器
-                        
-                        # 连续 20 次检测（约20秒）都是 100% 重复帧，才判定为真死锁
-                        if self._frozen_counter > 20: 
-                            self._trigger_global_restart(f"Frozen Stream (100% Dups for 20s)")
-                            break
-
-                        if (now - self._last_health_check > 60):
-                            fps = progress_data.get('fps', 'N/A')
-                            speed = progress_data.get('speed', 'N/A')
-                            mem = get_memory_usage()
-                            logger.info(f"[RTSP] Alive | {fps} fps | {speed}x speed | DupRatio: {delta_dup}/{delta_frame} | Mem: {mem}")
-                            self._last_health_check = now
-                except:
-                    pass
-                continue
-
-            if any(line.startswith(p) for p in allow_prefixes):
-                logger.info(f"[FFmpeg Info] {line}")
-            else:
-                is_fatal = any(x in line.lower() for x in ['failed', 'unable', 'no such', 'fatal', 'error'])
-                if is_fatal:
-                    # 只记录不处理，防止误杀
-                    pass
-
-        if self.process:
-            self.process.poll()
-            
-        if self._should_restart:
-            self.stop() 
+                        # [心跳日志] 每 60 秒打印一次，用于长期观察内存和存活状态
+                        if (now - self._last_health_check > 60): 
+                            match = pattern.search(l)
+                            if match:
+                                mem = get_memory_usage()
+                                logger.info(f"[RTSP] Alive | {match.group(0)} | Mem: {mem}")
+                                self._last_health_check = now
+                    else:
+                        # [错误日志] 只打印严重错误
+                        is_fatal = any(x in l.lower() for x in ['failed', 'unable', 'no such', 'fatal', 'error'])
+                        is_ignored = any(k in l.lower() for k in ignore_keywords)
+                        if is_fatal and not is_ignored:
+                            logger.error(f"[FFmpeg Error] {l}")
+            except Exception:
+                break
+        
+        # 线程退出时执行清理
+        self.stop()
 
     def stop(self):
-        with self._stop_lock:
-            if self.video_writer: 
-                self.video_writer.close(); self.video_writer = None
-            if self.audio_writer: 
-                self.audio_writer.close(); self.audio_writer = None
+        self._stop_event.set() # 信号量通知监控线程退出
+        
+        if self.video_writer: 
+            self.video_writer.close(); self.video_writer = None
+        if self.audio_writer: 
+            self.audio_writer.close(); self.audio_writer = None
             
-            if self.process:
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
                 try:
-                    self.process.terminate()
-                    try:
-                        self.process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"FFmpeg hung, force killing...")
-                        self.process.kill()
-                        self.process.wait(timeout=1)
-                except Exception:
+                    self.process.kill()
+                except:
                     pass
-                finally:
-                    self.process = None
+            self.process = None
             
-            time.sleep(0.5)
-            gc.collect()
+        gc.collect()
 
     def push_audio_raw(self, data: bytes):
         if self.audio_writer: self.audio_writer.write_direct(data)
