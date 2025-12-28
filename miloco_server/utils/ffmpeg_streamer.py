@@ -8,7 +8,7 @@ import fcntl
 import gc
 import psutil
 import select
-from typing import Optional
+from typing import Optional, Dict
 from miloco_server.config import RTSP_PORT
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,6 @@ def get_memory_usage():
         return "N/A"
 
 class PipeWriter:
-    """
-    [PipeWriter] 极低延迟版：小缓存 + 非阻塞
-    """
     def __init__(self, pipe_path, name, is_video=False):
         self.pipe_path = pipe_path
         self.name = name
@@ -40,18 +37,16 @@ class PipeWriter:
                 os.remove(self.pipe_path)
             os.mkfifo(self.pipe_path)
             
-            # 1. 使用非阻塞模式，防止死锁和内存溢出
             self.fd = os.open(self.pipe_path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 F_SETPIPE_SZ = 1031
-                # [核心修改] 只有砍掉缓存，才能物理上消除延迟
-                # 视频: 256KB (足够容纳一个 I 帧，但存不下1秒的积压)
-                # 音频: 16KB (约 0.5s，逼迫数据实时流动)
+                # [低延迟] 极小缓存，迫使数据实时流动
+                # 视频 256KB (约1-2关键帧)，音频 16KB (约0.5s)
                 size = 262144 if self.is_video else 16384
                 fcntl.fcntl(self.fd, F_SETPIPE_SZ, size)
             except Exception:
                 pass
-            logger.debug(f"[{self.name}] Pipe ready: {self.pipe_path}")
+            logger.debug(f"[{self.name}] Pipe opened: {self.pipe_path}")
             self._broken = False
             return True
         except Exception as e:
@@ -64,9 +59,6 @@ class PipeWriter:
         try:
             os.write(self.fd, data)
         except BlockingIOError:
-            # 管道满了，丢弃最新数据。
-            # 在小缓存模式下，这意味着"以前的数据"被保留，"新数据"被丢弃？
-            # 不，对于实时流，丢包比延迟好。保持管道不满才是关键。
             pass 
         except (BrokenPipeError, OSError) as e:
             if not self._broken:
@@ -92,8 +84,11 @@ class PipeWriter:
 
 
 class FFmpegStreamer:
-    _start_lock = threading.Lock()
-    # 冷却策略
+    # [关键修复] 全局进程注册表
+    # 无论实例化多少个对象，都通过这个字典管理进程，确保能杀死旧进程
+    _active_processes: Dict[str, subprocess.Popen] = {}
+    _process_lock = threading.Lock()
+    
     _global_cooldown_until = 0
     _global_cooldown_step = 10 
 
@@ -104,20 +99,20 @@ class FFmpegStreamer:
         self.pipe_audio = f"/tmp/miloco_audio_{camera_id}.pipe"
         self.video_writer: Optional[PipeWriter] = None
         self.audio_writer: Optional[PipeWriter] = None
-        self.process: Optional[subprocess.Popen] = None
+        
+        # 注意：不再使用 self.process 来管理生命周期，而是用 _active_processes
         self._last_health_check = 0
         self._stop_event = threading.Event()
 
     def start(self, video_codec="hevc"):
-        # 简单的冷却检查
+        # 冷却检查
         if time.time() < FFmpegStreamer._global_cooldown_until:
             return
-            
-        if not self._start_lock.acquire(blocking=False):
-            return
 
-        try:
-            self.stop() 
+        with FFmpegStreamer._process_lock:
+            # 1. 启动前，强制杀死该 camera_id 下已存在的任何进程
+            self._kill_active_process()
+
             self._stop_event.clear()
             self._last_health_check = time.time()
 
@@ -141,7 +136,8 @@ class FFmpegStreamer:
                     '-async_depth', '1',
                     '-rc_mode', 'CQP',
                     '-global_quality', '25',
-                    '-profile:v', 'main'
+                    '-profile:v', 'main',
+                    '-extra_hw_frames', '64'
                 ] + common_opts
             elif hw_accel in ["nvidia", "nvenc", "cuda"]:
                 logger.info(f"FFmpeg Mode: NVIDIA ({self.camera_id})")
@@ -151,7 +147,6 @@ class FFmpegStreamer:
                 video_out_args = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'baseline'] + common_opts
 
             video_filter_str = ",".join(video_filters)
-            # 音频同步：允许动态调整，防止断音
             audio_filter_chain = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
 
             try:
@@ -167,12 +162,11 @@ class FFmpegStreamer:
                     '-fflags', '+genpts+nobuffer+igndts',
                     '-flags', 'low_delay',
                     
-                    # [修复崩溃] 禁止滤镜重置
-                    '-reinit_filter', '0',
+                    '-bsf:v', 'hevc_mp4toannexb', 
                     
-                    # [极速启动] 减少探测时间，进一步降低起步延迟
-                    '-analyzeduration', '400000', 
-                    '-probesize', '200000',       
+                    # [低延迟优化] 极小的探测缓冲，FFmpeg 只要读到一点点头信息就开始推流
+                    '-analyzeduration', '100000', # 0.1秒
+                    '-probesize', '32768',        # 32KB
                     '-err_detect', 'ignore_err',
                 ]
 
@@ -180,12 +174,11 @@ class FFmpegStreamer:
                 ffmpeg_cmd.extend([
                     '-thread_queue_size', '128',
                     '-f', video_codec,
-                    '-use_wallclock_as_timestamps', '1', 
+                    '-use_wallclock_as_timestamps', '1',
                     '-i', self.pipe_video,
 
                     '-thread_queue_size', '512',
                     '-f', 's16le', '-ar', '16000', '-ac', '1',
-                    # 移除音频绝对时间戳，配合小缓存解决延迟和断音
                     '-i', self.pipe_audio,
 
                     '-map', '0:v', '-map', '1:a',
@@ -199,48 +192,66 @@ class FFmpegStreamer:
                     self.rtsp_url,
                 ])
 
-                self.process = subprocess.Popen(
+                process = subprocess.Popen(
                     ffmpeg_cmd, 
                     stdout=subprocess.DEVNULL, 
                     stderr=subprocess.PIPE,
                     text=True,  
                     bufsize=1   
                 )
-                threading.Thread(target=self._monitor_ffmpeg, daemon=True).start()
+                
+                # 注册到全局字典
+                FFmpegStreamer._active_processes[self.camera_id] = process
+                
+                threading.Thread(target=self._monitor_ffmpeg, args=(process,), daemon=True).start()
 
             except Exception as e:
                 logger.error(f"FFmpeg start failed: {e}")
                 self.stop()
-        finally:
-            self._start_lock.release()
+
+    def _kill_active_process(self):
+        """查找并杀死当前摄像头ID对应的所有旧进程"""
+        if self.camera_id in FFmpegStreamer._active_processes:
+            old_proc = FFmpegStreamer._active_processes[self.camera_id]
+            try:
+                old_proc.terminate()
+                old_proc.wait(timeout=2)
+            except:
+                try:
+                    old_proc.kill()
+                except:
+                    pass
+            del FFmpegStreamer._active_processes[self.camera_id]
+            # 强制回收
+            gc.collect()
+            # 增加一点点等待，确保端口释放
+            time.sleep(0.5)
 
     def _trigger_restart(self, reason):
         logger.error(f"[Watchdog] {reason}. Cooling down.")
         FFmpegStreamer._global_cooldown_until = time.time() + FFmpegStreamer._global_cooldown_step
-        # 简单增加步进
         FFmpegStreamer._global_cooldown_step = min(FFmpegStreamer._global_cooldown_step + 10, 60)
         self.stop()
 
-    def _monitor_ffmpeg(self):
-        if not self.process: return
-        
-        fd = self.process.stderr.fileno()
+    def _monitor_ffmpeg(self, proc):
+        # 传递具体的 proc 对象，避免引用混淆
+        fd = proc.stderr.fileno()
         os.set_blocking(fd, False)
         
         pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
         ignore_keywords = ['pps', 'nalu', 'header', 'buffer', 'frame rate', 'unspecified', 'params', 'last message repeated', 'deprecated']
 
-        # 简单看门狗：只监视是否存活和严重错误
-        # 不再监视 Dup，因为那是正常现象
         while not self._stop_event.is_set():
-            if self.process.poll() is not None:
-                logger.error(f"FFmpeg exited (Code: {self.process.returncode})")
+            if proc.poll() is not None:
+                # 只有当它是当前活跃进程时才报错，避免旧进程退出的干扰
+                if FFmpegStreamer._active_processes.get(self.camera_id) == proc:
+                    logger.error(f"FFmpeg exited (Code: {proc.returncode})")
                 break
 
             try:
                 ready = select.select([fd], [], [], 1.0)
                 if ready[0]:
-                    line = self.process.stderr.readline()
+                    line = proc.stderr.readline()
                     if not line: continue
                     l = line.strip()
                     if not l: continue
@@ -253,21 +264,22 @@ class FFmpegStreamer:
                                 mem = get_memory_usage()
                                 logger.info(f"[RTSP] Alive | {match.group(0)} | Mem: {mem}")
                                 self._last_health_check = now
-                                # 成功运行后重置冷却
                                 FFmpegStreamer._global_cooldown_step = 10
                     else:
                         is_fatal = any(x in l.lower() for x in ['failed', 'unable', 'no such', 'fatal', 'error'])
                         is_ignored = any(k in l.lower() for k in ignore_keywords)
                         if is_fatal and not is_ignored:
                             logger.error(f"[FFmpeg Error] {l}")
-                            # 遇到严重配置错误，触发重启保护
                             if "invalid argument" in l.lower() or "function not implemented" in l.lower():
                                 self._trigger_restart(f"Fatal Config Error: {l}")
                                 return
             except Exception:
                 break
         
-        self.stop()
+        # 监控结束，如果是当前进程，则清理
+        with FFmpegStreamer._process_lock:
+            if FFmpegStreamer._active_processes.get(self.camera_id) == proc:
+                self.stop()
 
     def stop(self):
         self._stop_event.set()
@@ -277,18 +289,8 @@ class FFmpegStreamer:
         if self.audio_writer: 
             self.audio_writer.close(); self.audio_writer = None
             
-        if self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except:
-                try:
-                    self.process.kill()
-                except:
-                    pass
-            self.process = None
-            
-        gc.collect()
+        with FFmpegStreamer._process_lock:
+            self._kill_active_process()
 
     def push_audio_raw(self, data: bytes):
         if self.audio_writer: self.audio_writer.write_direct(data)
