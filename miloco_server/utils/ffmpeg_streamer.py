@@ -14,7 +14,6 @@ from miloco_server.config import RTSP_PORT
 logger = logging.getLogger(__name__)
 
 def get_memory_usage():
-    """获取当前进程内存占用，用于监控泄漏"""
     try:
         process = psutil.Process(os.getpid())
         mem = process.memory_info().rss / 1024 / 1024
@@ -24,32 +23,35 @@ def get_memory_usage():
 
 class PipeWriter:
     """
-    [PipeWriter] 稳定版：非阻塞 I/O + 异常状态记录
+    [PipeWriter] 极低延迟版：小缓存 + 非阻塞
     """
     def __init__(self, pipe_path, name, is_video=False):
         self.pipe_path = pipe_path
         self.name = name
         self.is_video = is_video
         self.fd = None
-        self._broken = False # 状态标记，防止日志刷屏
+        self._broken = False
         self._ensure_pipe()
 
     def _ensure_pipe(self):
-        self.close() 
+        self.close()
         try:
             if os.path.exists(self.pipe_path):
                 os.remove(self.pipe_path)
             os.mkfifo(self.pipe_path)
             
-            # 使用非阻塞模式打开，这是防止 Python 线程卡死(导致内存不释放)的关键
+            # 1. 使用非阻塞模式，防止死锁和内存溢出
             self.fd = os.open(self.pipe_path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 F_SETPIPE_SZ = 1031
-                size = 1048576 if self.is_video else 131072
+                # [核心修改] 只有砍掉缓存，才能物理上消除延迟
+                # 视频: 256KB (足够容纳一个 I 帧，但存不下1秒的积压)
+                # 音频: 16KB (约 0.5s，逼迫数据实时流动)
+                size = 262144 if self.is_video else 16384
                 fcntl.fcntl(self.fd, F_SETPIPE_SZ, size)
             except Exception:
                 pass
-            logger.debug(f"[{self.name}] Pipe opened: {self.pipe_path}")
+            logger.debug(f"[{self.name}] Pipe ready: {self.pipe_path}")
             self._broken = False
             return True
         except Exception as e:
@@ -62,12 +64,13 @@ class PipeWriter:
         try:
             os.write(self.fd, data)
         except BlockingIOError:
-            # 管道满了，丢弃数据。这是正常的背压保护，不打印日志以免刷屏
+            # 管道满了，丢弃最新数据。
+            # 在小缓存模式下，这意味着"以前的数据"被保留，"新数据"被丢弃？
+            # 不，对于实时流，丢包比延迟好。保持管道不满才是关键。
             pass 
         except (BrokenPipeError, OSError) as e:
-            # [关键诊断日志] 管道破裂意味着 FFmpeg 进程可能已经挂了
             if not self._broken:
-                logger.warning(f"[{self.name}] Pipe broken/disconnected: {e}")
+                logger.warning(f"[{self.name}] Pipe broken: {e}")
                 self._broken = True
             self.close()
 
@@ -89,8 +92,10 @@ class PipeWriter:
 
 
 class FFmpegStreamer:
-    # 全局锁，防止多次点击导致并发冲突
     _start_lock = threading.Lock()
+    # 冷却策略
+    _global_cooldown_until = 0
+    _global_cooldown_step = 10 
 
     def __init__(self, camera_id: str, rtsp_target=None):
         self.camera_id = camera_id
@@ -104,12 +109,15 @@ class FFmpegStreamer:
         self._stop_event = threading.Event()
 
     def start(self, video_codec="hevc"):
+        # 简单的冷却检查
+        if time.time() < FFmpegStreamer._global_cooldown_until:
+            return
+            
         if not self._start_lock.acquire(blocking=False):
-            logger.warning(f"Start request ignored: Another start sequence is in progress.")
             return
 
         try:
-            self.stop() # 启动前先彻底清理
+            self.stop() 
             self._stop_event.clear()
             self._last_health_check = time.time()
 
@@ -135,18 +143,15 @@ class FFmpegStreamer:
                     '-global_quality', '25',
                     '-profile:v', 'main'
                 ] + common_opts
-
             elif hw_accel in ["nvidia", "nvenc", "cuda"]:
                 logger.info(f"FFmpeg Mode: NVIDIA ({self.camera_id})")
                 video_out_args = ['-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'zerolatency'] + common_opts
-
             else:
                 logger.info(f"FFmpeg Mode: CPU ({self.camera_id})")
                 video_out_args = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-profile:v', 'baseline'] + common_opts
 
             video_filter_str = ",".join(video_filters)
-            
-            # [低延迟音频配置] async=1 + min_hard_comp 允许动态对齐，解决断音和延迟
+            # 音频同步：允许动态调整，防止断音
             audio_filter_chain = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
 
             try:
@@ -157,31 +162,30 @@ class FFmpegStreamer:
                     'ffmpeg', '-y',
                     '-hide_banner',
                     '-loglevel', 'warning', 
-                    '-stats',  
+                    '-stats',
 
                     '-fflags', '+genpts+nobuffer+igndts',
                     '-flags', 'low_delay',
                     
-                    # [新增优化] 禁止滤镜自动重置，防止因分辨率/格式切换导致的崩溃
-                    '-reinit_filter', '0', 
-
-                    '-analyzeduration', '1000000',
-                    '-probesize', '1000000',
+                    # [修复崩溃] 禁止滤镜重置
+                    '-reinit_filter', '0',
+                    
+                    # [极速启动] 减少探测时间，进一步降低起步延迟
+                    '-analyzeduration', '400000', 
+                    '-probesize', '200000',       
                     '-err_detect', 'ignore_err',
                 ]
 
-
                 ffmpeg_cmd.extend(global_args)
-
                 ffmpeg_cmd.extend([
                     '-thread_queue_size', '128',
                     '-f', video_codec,
-                    '-use_wallclock_as_timestamps', '1', # 视频使用绝对时钟，保证画面低延迟
+                    '-use_wallclock_as_timestamps', '1', 
                     '-i', self.pipe_video,
 
                     '-thread_queue_size', '512',
                     '-f', 's16le', '-ar', '16000', '-ac', '1',
-                    '-use_wallclock_as_timestamps', '1', # 音频也使用绝对时钟，通过 aresample 解决断续
+                    # 移除音频绝对时间戳，配合小缓存解决延迟和断音
                     '-i', self.pipe_audio,
 
                     '-map', '0:v', '-map', '1:a',
@@ -210,55 +214,63 @@ class FFmpegStreamer:
         finally:
             self._start_lock.release()
 
+    def _trigger_restart(self, reason):
+        logger.error(f"[Watchdog] {reason}. Cooling down.")
+        FFmpegStreamer._global_cooldown_until = time.time() + FFmpegStreamer._global_cooldown_step
+        # 简单增加步进
+        FFmpegStreamer._global_cooldown_step = min(FFmpegStreamer._global_cooldown_step + 10, 60)
+        self.stop()
+
     def _monitor_ffmpeg(self):
         if not self.process: return
         
-        # 使用 select 监听 stderr，这是防止僵死和内存泄露的最稳健方法
         fd = self.process.stderr.fileno()
         os.set_blocking(fd, False)
         
         pattern = re.compile(r'frame=\s*(\d+).*fps=\s*([\d.]+).*speed=\s*([\d.]+)x')
-        # 忽略常规的启动警告
         ignore_keywords = ['pps', 'nalu', 'header', 'buffer', 'frame rate', 'unspecified', 'params', 'last message repeated', 'deprecated']
 
+        # 简单看门狗：只监视是否存活和严重错误
+        # 不再监视 Dup，因为那是正常现象
         while not self._stop_event.is_set():
             if self.process.poll() is not None:
-                logger.error(f"FFmpeg process exited unexpectedly (Code: {self.process.returncode})")
+                logger.error(f"FFmpeg exited (Code: {self.process.returncode})")
                 break
 
             try:
-                # 1秒超时，不阻塞线程
                 ready = select.select([fd], [], [], 1.0)
                 if ready[0]:
                     line = self.process.stderr.readline()
                     if not line: continue
-                    
                     l = line.strip()
                     if not l: continue
 
                     if "frame=" in l:
                         now = time.time()
-                        # [心跳日志] 每 60 秒打印一次，用于长期观察内存和存活状态
                         if (now - self._last_health_check > 60): 
                             match = pattern.search(l)
                             if match:
                                 mem = get_memory_usage()
                                 logger.info(f"[RTSP] Alive | {match.group(0)} | Mem: {mem}")
                                 self._last_health_check = now
+                                # 成功运行后重置冷却
+                                FFmpegStreamer._global_cooldown_step = 10
                     else:
-                        # [错误日志] 只打印严重错误
                         is_fatal = any(x in l.lower() for x in ['failed', 'unable', 'no such', 'fatal', 'error'])
                         is_ignored = any(k in l.lower() for k in ignore_keywords)
                         if is_fatal and not is_ignored:
                             logger.error(f"[FFmpeg Error] {l}")
+                            # 遇到严重配置错误，触发重启保护
+                            if "invalid argument" in l.lower() or "function not implemented" in l.lower():
+                                self._trigger_restart(f"Fatal Config Error: {l}")
+                                return
             except Exception:
                 break
         
-        # 线程退出时执行清理
         self.stop()
 
     def stop(self):
-        self._stop_event.set() # 信号量通知监控线程退出
+        self._stop_event.set()
         
         if self.video_writer: 
             self.video_writer.close(); self.video_writer = None
