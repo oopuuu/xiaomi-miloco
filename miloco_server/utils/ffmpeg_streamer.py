@@ -157,15 +157,19 @@ class FFmpegStreamer:
                     'ffmpeg', '-y',
                     '-hide_banner',
                     '-loglevel', 'warning', 
-                    '-stats',  # 必须开启，否则无法监控进度
+                    '-stats',  
 
                     '-fflags', '+genpts+nobuffer+igndts',
                     '-flags', 'low_delay',
+                    
+                    # [新增优化] 禁止滤镜自动重置，防止因分辨率/格式切换导致的崩溃
+                    '-reinit_filter', '0', 
 
                     '-analyzeduration', '1000000',
                     '-probesize', '1000000',
                     '-err_detect', 'ignore_err',
                 ]
+
 
                 ffmpeg_cmd.extend(global_args)
 
