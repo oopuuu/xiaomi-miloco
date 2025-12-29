@@ -6,6 +6,7 @@ import subprocess
 import requests
 import stat
 import atexit
+import time  # 新增引用
 from miloco_server.config import RTSP_PORT, SERVER_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,13 @@ class MediaMtxManager:
             self.bin_path += ".exe"
 
     def ensure_binary(self):
-        if os.path.exists(self.bin_path): return
+        if os.path.exists(self.bin_path):
+            return
 
-        logger.info("MediaMTX binary not found. Downloading...")
-        if not os.path.exists(self.bin_dir): os.makedirs(self.bin_dir)
+        if not os.path.exists(self.bin_dir):
+            os.makedirs(self.bin_dir)
 
+        # 1. 系统架构判断
         system = platform.system().lower()
         machine = platform.machine().lower()
         version = "v1.9.1"
@@ -42,29 +45,52 @@ class MediaMtxManager:
             else:
                 arch = "amd64"
         else:
-            logger.error(f"Unsupported OS: {system}")
+            logger.error(f"Unsupported OS for MediaMTX auto-download: {system}")
             return
 
         url = f"https://github.com/bluenviron/mediamtx/releases/download/{version}/mediamtx_{version}_{os_name}_{arch}.tar.gz"
 
-        try:
-            import tarfile
-            from io import BytesIO
-            resp = requests.get(url)
-            resp.raise_for_status()
-            with tarfile.open(fileobj=BytesIO(resp.content), mode="r:gz") as tar:
-                tar.extractall(path=self.bin_dir)
+        # 2. 增加重试机制
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"MediaMTX binary not found. Downloading from {url} (Attempt {attempt + 1}/{max_retries})...")
+                
+                import tarfile
+                from io import BytesIO
+                
+                # 设置超时时间，防止挂起
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                
+                # 解压文件
+                with tarfile.open(fileobj=BytesIO(resp.content), mode="r:gz") as tar:
+                    tar.extractall(path=self.bin_dir)
 
-            st = os.stat(self.bin_path)
-            os.chmod(self.bin_path, st.st_mode | stat.S_IEXEC)
+                # 设置执行权限
+                if os.path.exists(self.bin_path):
+                    st = os.stat(self.bin_path)
+                    os.chmod(self.bin_path, st.st_mode | stat.S_IEXEC)
+                else:
+                    raise FileNotFoundError("Extracted file not found, download might be corrupted.")
 
-            if system == "darwin":
-                try:
-                    subprocess.run(["xattr", "-d", "com.apple.quarantine", self.bin_path], stderr=subprocess.DEVNULL)
-                except:
-                    pass
-        except Exception as e:
-            logger.error(f"Failed to download MediaMTX: {e}")
+                # macOS 特殊处理
+                if system == "darwin":
+                    try:
+                        subprocess.run(["xattr", "-d", "com.apple.quarantine", self.bin_path], stderr=subprocess.DEVNULL)
+                    except:
+                        pass
+                
+                logger.info("MediaMTX downloaded and setup successfully.")
+                return  # 成功后直接返回
+
+            except Exception as e:
+                logger.warning(f"Failed to download MediaMTX (Attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info("Retrying in 3 seconds...")
+                    time.sleep(3)  # 失败后等待几秒再试
+                else:
+                    logger.error("MediaMTX download failed after all retries. Please install manually.")
 
     def create_hook_script(self, api_base):
         """生成钩子脚本，避免命令行转义噩梦"""
@@ -104,7 +130,10 @@ while true; do sleep 1; done
 
     def start(self):
         self.ensure_binary()
-        if not os.path.exists(self.bin_path): return
+        if not os.path.exists(self.bin_path): 
+            logger.error(f"MediaMTX binary still missing at {self.bin_path}, skipping start.")
+            return
+
         port = SERVER_CONFIG["port"]
         miloco_api_base = f"https://127.0.0.1:{port}/api/miot/internal/stream"
 
