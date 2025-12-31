@@ -36,11 +36,15 @@ class PipeWriter:
             if os.path.exists(self.pipe_path):
                 os.remove(self.pipe_path)
             os.mkfifo(self.pipe_path)
+            
             self.fd = os.open(self.pipe_path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 F_SETPIPE_SZ = 1031
-                # 保持 1MB 缓冲，这是目前测试下来最稳的值
-                size = 1048576 if self.is_video else 65536
+                # [极低延迟模式] 
+                # 视频: 256KB (约 3-5 帧，不允许积压)
+                # 音频: 16KB (瞬时转发)
+                # 这是一个“宁可丢包，不可延迟”的设置
+                size = 262144 if self.is_video else 16384
                 fcntl.fcntl(self.fd, F_SETPIPE_SZ, size)
             except:
                 pass
@@ -54,11 +58,10 @@ class PipeWriter:
         try:
             os.write(self.fd, data)
         except BlockingIOError:
-            # 熔断机制：管道满立即重启
-            logger.warning(f"[{self.name}] Pipe FULL! Restarting...")
-            self.close()
-            if self.owner:
-                threading.Thread(target=self.owner._trigger_restart, args=("Pipe Blocked",), daemon=True).start()
+            # [丢包策略]
+            # 为了保证实时性，管道满时直接丢弃当前包，而不是重启
+            # 只有当持续堵塞导致看门狗超时，才会在上层逻辑处理
+            pass 
         except Exception:
             self.close()
 
@@ -112,56 +115,51 @@ class FFmpegStreamer:
             hw_accel = os.getenv("MILOCO_HW_ACCEL", "cpu").lower()
             hw_device = os.getenv("MILOCO_HW_DEVICE", "/dev/dri/renderD128")
 
-            # [配置核心] 混合模式：CPU解码 -> 上传 -> GPU编码
+            # 混合模式架构：CPU解码 -> 上传 -> GPU编码
             global_args = []
             video_filters = ["setpts=PTS-STARTPTS"] 
             video_out_args = []
-            
-            # 基础编码参数：低延迟，禁B帧
             common_opts = ['-bf', '0']
 
             if hw_accel in ["intel", "amd", "vaapi"]:
-                logger.info(f"FFmpeg Mode: Hybrid (CPU Decode -> VAAPI Encode) ({self.camera_id})")
-                
-                # 1. 初始化 VAAPI 设备，但不用于输入解码
+                logger.info(f"FFmpeg Mode: Hybrid Low Latency ({self.camera_id})")
                 global_args = [
                     '-init_hw_device', f'vaapi=va:{hw_device}',
                     '-filter_hw_device', 'va'
                 ]
-                
-                # 2. 关键滤镜链：
-                # format=nv12: 确保 CPU 内存中的数据格式正确
-                # hwupload: 将数据从 CPU 内存搬运到 GPU 显存
                 video_filters.extend(['format=nv12', 'hwupload'])
                 
-                # 3. 编码器设置
+                # [低延迟编码参数]
                 video_out_args = [
                     '-c:v', 'h264_vaapi',
-                    '-g', '25',           # 1秒 I 帧
-                    '-rc_mode', 'CQP',    # 恒定质量模式
+                    '-g', '25',
+                    '-rc_mode', 'CQP',    
                     '-global_quality', '28', 
                     '-profile:v', 'main',
-                    '-async_depth', '1'   # 降低缓冲延迟
+                    '-async_depth', '1' # 禁止显卡缓冲，来一帧编一帧
                 ] + common_opts
 
             elif hw_accel in ["nvidia", "nvenc", "cuda"]:
-                logger.info(f"FFmpeg Mode: Hybrid (CPU Decode -> NVENC Encode) ({self.camera_id})")
-                # Nvidia 比较智能，通常不需要显式 upload，直接喂给它就行
+                logger.info(f"FFmpeg Mode: Hybrid Low Latency (NVENC) ({self.camera_id})")
                 video_out_args = [
                     '-c:v', 'h264_nvenc', 
-                    '-preset', 'p2', 
-                    '-tune', 'zerolatency',
+                    '-preset', 'p1',       # 最快预设
+                    '-tune', 'zerolatency', # 零延迟调优
+                    '-delay', '0',
                     '-g', '25'
                 ] + common_opts
-                
             else:
-                # 兜底 CPU
-                logger.info(f"FFmpeg Mode: CPU Only ({self.camera_id})")
+                logger.info(f"FFmpeg Mode: CPU Low Latency ({self.camera_id})")
                 video_out_args = [
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-g', '25'
+                    '-c:v', 'libx264', 
+                    '-preset', 'ultrafast', 
+                    '-tune', 'zerolatency', 
+                    '-g', '25'
                 ] + common_opts
 
             video_filter_str = ",".join(video_filters)
+            
+            # [低延迟音频] async=1: 只做微小调整，不引入大缓冲
             audio_filter_chain = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
 
             try:
@@ -170,25 +168,28 @@ class FFmpegStreamer:
 
                 ffmpeg_cmd = [
                     'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning', '-stats',
-                    '-fflags', '+genpts+nobuffer+igndts',
-                    '-flags', 'low_delay',
                     
-                    '-analyzeduration', '500000', 
-                    '-probesize', '500000',
-
-                    # [关键变化] 这里没有任何 -hwaccel 参数！强制 CPU 解码
+                    # [极速启动 & 零缓冲]
+                    '-fflags', '+genpts+nobuffer+igndts', # 禁用所有 FFmpeg 内部缓冲
+                    '-flags', 'low_delay',                # 开启低延迟标志
+                    '-reinit_filter', '0',                # 避免滤镜重置带来的卡顿
+                    
+                    '-analyzeduration', '200000', # 0.2秒探测
+                    '-probesize', '200000',
                 ]
                 
-                ffmpeg_cmd.extend(global_args) # 插入设备初始化参数
+                ffmpeg_cmd.extend(global_args)
                 
                 ffmpeg_cmd.extend([
-                    '-thread_queue_size', '1024',
+                    # [小队列] 强制快速处理，堆积即丢弃
+                    '-thread_queue_size', '64',
                     '-f', video_codec,
                     '-use_wallclock_as_timestamps', '1',
                     '-i', self.pipe_video,
 
-                    '-thread_queue_size', '512',
+                    '-thread_queue_size', '64',
                     '-f', 's16le', '-ar', '16000', '-ac', '1',
+                    # 音频依然使用采样率时间戳，保证连续性
                     '-i', self.pipe_audio,
 
                     '-map', '0:v', '-map', '1:a',
@@ -197,10 +198,13 @@ class FFmpegStreamer:
 
                     *video_out_args,
                     
-                    '-c:a', 'aac', '-ar', '16000', '-b:a', '64k',
+                    '-c:a', 'aac', '-ar', '16000', '-b:a', '32k',
                     
-                    # 保持 UDP + 分包
-                    '-f', 'rtsp', '-rtsp_transport', 'udp', '-pkt_size', '1316', '-max_muxing_queue_size', '1024',
+                    # UDP + 小队列输出
+                    '-f', 'rtsp', 
+                    '-rtsp_transport', 'udp', 
+                    '-pkt_size', '1316', 
+                    '-max_muxing_queue_size', '100', # 输出队列只要满 100 个包就丢弃，防止延迟累积
                     self.rtsp_url,
                 ])
 
